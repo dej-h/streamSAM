@@ -17,7 +17,6 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from moviepy.editor import ImageSequenceClip
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor
 
@@ -67,6 +66,8 @@ examples = [
 ]
 
 OBJ_ID = 0
+MAX_DIMENSION = 960  # cap resolution to avoid OOM
+CHUNK_SIZE_FRAMES = 96  # process full videos in chunks to avoid OOM
 
 if torch.backends.mps.is_available():
     DEVICE = "mps"
@@ -102,13 +103,24 @@ def get_video_fps(video_path):
     return fps
 
 
+def cleanup_temp_chunks(session_state):
+    for chunk_path in session_state.get("video_chunk_paths", []):
+        try:
+            os.remove(chunk_path)
+        except OSError:
+            pass
+    session_state["video_chunk_paths"] = []
+    session_state["video_fps"] = None
+    session_state["is_temp_chunks"] = False
+
+
 def reset(session_state):
     session_state["input_points"] = []
     session_state["input_labels"] = []
     if session_state["inference_state"] is not None:
         predictor.reset_state(session_state["inference_state"])
+    cleanup_temp_chunks(session_state)
     session_state["first_frame"] = None
-    session_state["all_frames"] = None
     session_state["inference_state"] = None
     return (
         None,
@@ -143,7 +155,7 @@ def preprocess_video_in(video_path, session_state):
             session_state,
         )
 
-    # Read the first frame
+    # Read and preprocess input video into temporary chunk videos for tracking
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print("Error: Could not open video.")
@@ -155,9 +167,20 @@ def preprocess_video_in(video_path, session_state):
             session_state,
         )
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 0:
+        fps = 30
+
+    cleanup_temp_chunks(session_state)
+
     frame_number = 0
     first_frame = None
-    all_frames = []
+    output_writer = None
+    chunk_idx = 0
+    frames_in_chunk = 0
+    chunk_paths = []
+    chunk_video_path = None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
     while True:
         ret, frame = cap.read()
@@ -165,20 +188,62 @@ def preprocess_video_in(video_path, session_state):
             break
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = np.array(frame)
 
-        # Store the first frame
+        # Downscale if resolution exceeds MAX_DIMENSION
+        h, w = frame.shape[:2]
+        if max(h, w) > MAX_DIMENSION:
+            scale = MAX_DIMENSION / max(h, w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+
         if frame_number == 0:
-            first_frame = frame
-        all_frames.append(frame)
+            first_frame = np.array(frame)
+
+        if output_writer is None:
+            chunk_video_path = os.path.join(
+                tempfile.gettempdir(),
+                f"edgetam_chunk_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{chunk_idx:04d}.mp4",
+            )
+            out_h, out_w = frame.shape[:2]
+            output_writer = cv2.VideoWriter(chunk_video_path, fourcc, fps, (out_w, out_h))
+
+        output_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        frames_in_chunk += 1
 
         frame_number += 1
 
-    cap.release()
-    session_state["first_frame"] = copy.deepcopy(first_frame)
-    session_state["all_frames"] = all_frames
+        if frames_in_chunk >= CHUNK_SIZE_FRAMES:
+            output_writer.release()
+            output_writer = None
+            chunk_paths.append(chunk_video_path)
+            chunk_idx += 1
+            frames_in_chunk = 0
 
-    session_state["inference_state"] = predictor.init_state(video_path=video_path)
+    cap.release()
+    if output_writer is not None:
+        output_writer.release()
+        chunk_paths.append(chunk_video_path)
+
+    if first_frame is None:
+        print("Error: Could not read any frame from video.")
+        return (
+            gr.update(open=True),
+            None,
+            None,
+            gr.update(value=None, visible=False),
+            session_state,
+        )
+
+    session_state["first_frame"] = copy.deepcopy(first_frame)
+    session_state["video_chunk_paths"] = chunk_paths
+    session_state["video_fps"] = fps
+    session_state["is_temp_chunks"] = True
+    print(f"Prepared {len(chunk_paths)} chunks for full-video tracking.")
+
+    session_state["inference_state"] = predictor.init_state(
+        video_path=chunk_paths[0],
+        offload_video_to_cpu=True,  # keep video tensors on CPU RAM, not VRAM
+        offload_state_to_cpu=True,
+    )
     session_state["input_points"] = []
     session_state["input_labels"] = []
 
@@ -278,44 +343,81 @@ def propagate_to_all(
             session_state,
         )
 
-    # run propagation throughout the video and collect the results in a dict
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    print("starting propagate_in_video")
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-        session_state["inference_state"]
-    ):
-        video_segments[out_frame_idx] = {
-            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
-
-    # obtain the segmentation results every few frames
-    vis_frame_stride = 1
-
-    output_frames = []
-    for out_frame_idx in range(0, len(video_segments), vis_frame_stride):
-        transparent_background = Image.fromarray(
-            session_state["all_frames"][out_frame_idx]
-        ).convert("RGBA")
-        out_mask = video_segments[out_frame_idx][OBJ_ID]
-        mask_image = show_mask(out_mask)
-        output_frame = Image.alpha_composite(transparent_background, mask_image)
-        output_frame = np.array(output_frame)
-        output_frames.append(output_frame)
-
-    torch.cuda.empty_cache()
-
-    # Create a video clip from the image sequence
-    original_fps = get_video_fps(video_in)
-    fps = original_fps  # Frames per second
-    clip = ImageSequenceClip(output_frames, fps=fps)
-    # Write the result to a file
     unique_id = datetime.now().strftime("%Y%m%d%H%M%S")
     final_vid_output_path = f"output_video_{unique_id}.mp4"
     final_vid_output_path = os.path.join(tempfile.gettempdir(), final_vid_output_path)
 
-    # Write the result to a file
-    clip.write_videofile(final_vid_output_path, codec="libx264")
+    output_writer = None
+    fps = session_state.get("video_fps")
+    if fps is None or fps <= 0:
+        fps = 30
+
+    chunk_paths = session_state.get("video_chunk_paths", [])
+    if not chunk_paths:
+        return (
+            None,
+            session_state,
+        )
+
+    carried_mask = None
+    print("starting chunked propagate_in_video")
+    for chunk_idx, chunk_path in enumerate(chunk_paths):
+        if chunk_idx == 0:
+            inference_state = session_state["inference_state"]
+        else:
+            inference_state = predictor.init_state(
+                video_path=chunk_path,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True,
+            )
+            if carried_mask is not None:
+                predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=OBJ_ID,
+                    mask=carried_mask,
+                )
+
+        cap_out = cv2.VideoCapture(chunk_path)
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+            inference_state
+        ):
+            cap_out.set(cv2.CAP_PROP_POS_FRAMES, out_frame_idx)
+            ret, frame = cap_out.read()
+            if not ret:
+                break
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            obj_ids_list = list(out_obj_ids)
+            if OBJ_ID not in obj_ids_list:
+                continue
+            obj_pos = obj_ids_list.index(OBJ_ID)
+            out_mask = (out_mask_logits[obj_pos] > 0.0).cpu().numpy()
+            if out_mask.ndim == 3 and out_mask.shape[0] == 1:
+                out_mask = out_mask[0]
+            carried_mask = out_mask
+
+            transparent_background = Image.fromarray(frame).convert("RGBA")
+            mask_image = show_mask(out_mask)
+            output_frame = Image.alpha_composite(transparent_background, mask_image)
+            output_frame = np.array(output_frame.convert("RGB"))
+
+            if output_writer is None:
+                out_h, out_w = output_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                output_writer = cv2.VideoWriter(
+                    final_vid_output_path, fourcc, fps, (out_w, out_h)
+                )
+
+            output_writer.write(cv2.cvtColor(output_frame, cv2.COLOR_RGB2BGR))
+
+        cap_out.release()
+        predictor.reset_state(inference_state)
+
+    if output_writer is not None:
+        output_writer.release()
+
+    torch.cuda.empty_cache()
 
     return (
         gr.update(value=final_vid_output_path),
@@ -331,7 +433,9 @@ with gr.Blocks() as demo:
     session_state = gr.State(
         {
             "first_frame": None,
-            "all_frames": None,
+            "video_chunk_paths": [],
+            "video_fps": None,
+            "is_temp_chunks": False,
             "input_points": [],
             "input_labels": [],
             "inference_state": None,
