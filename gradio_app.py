@@ -10,6 +10,8 @@ from datetime import datetime
 
 import gradio as gr
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 os.environ["TORCH_CUDNN_SDPA_ENABLED"] = "0,1,2,3,4,5,6,7"
 import tempfile
 
@@ -64,6 +66,7 @@ examples = [
     ["examples/23_racecar.mp4"],
     ["examples/24_clownfish.mp4"],
 ]
+examples = [[os.path.join(APP_DIR, sample[0])] for sample in examples]
 
 OBJ_ID = 0
 MAX_DIMENSION = 960  # cap resolution to avoid OOM
@@ -77,6 +80,7 @@ else:
     DEVICE = "cpu"
 sam2_checkpoint = "checkpoints/edgetam.pt"
 model_cfg = "edgetam.yaml"
+sam2_checkpoint = os.path.join(APP_DIR, sam2_checkpoint)
 predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=DEVICE)
 print("PREDICTOR LOADED")
 
