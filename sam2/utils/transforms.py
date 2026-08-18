@@ -24,6 +24,7 @@ class SAM2Transforms(nn.Module):
         self.mask_threshold = mask_threshold
         self.max_hole_area = max_hole_area
         self.max_sprinkle_area = max_sprinkle_area
+        # ImageNet RGB mean/std (R, G, B), matching SAM2 pretrained preprocessing.
         self.mean = [0.485, 0.456, 0.406]
         self.std = [0.229, 0.224, 0.225]
         self.to_tensor = ToTensor()

@@ -173,6 +173,7 @@ def load_video_frames(
     video_path,
     image_size,
     offload_video_to_cpu,
+    # ImageNet RGB mean/std (R, G, B), used by the SAM2 checkpoint preprocessing.
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
@@ -214,6 +215,7 @@ def load_video_frames_from_jpg_images(
     video_path,
     image_size,
     offload_video_to_cpu,
+    # ImageNet RGB mean/std (R, G, B), used by the SAM2 checkpoint preprocessing.
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
@@ -281,6 +283,7 @@ def load_video_frames_from_video_file(
     video_path,
     image_size,
     offload_video_to_cpu,
+    # ImageNet RGB mean/std (R, G, B), used by the SAM2 checkpoint preprocessing.
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     compute_device=torch.device("cuda"),
