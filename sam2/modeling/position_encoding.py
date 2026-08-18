@@ -37,7 +37,7 @@ class PositionEmbeddingSine(nn.Module):
             scale = 2 * math.pi
         self.scale = scale
 
-        self.cache = {}
+        self.cache: dict[tuple[int, int], torch.Tensor] = {}
 
     def _encode_xy(self, x, y):
         # The positions are expected to be normalized
@@ -76,9 +76,10 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         cache_key = (x.shape[-2], x.shape[-1])
-        if cache_key in self.cache:
+        is_compiling = torch.compiler.is_compiling()
+        if not is_compiling and cache_key in self.cache:
             return self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)
         y_embed = (
             torch.arange(1, x.shape[-2] + 1, dtype=torch.float32, device=x.device)
@@ -108,7 +109,8 @@ class PositionEmbeddingSine(nn.Module):
             (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
         ).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
-        self.cache[cache_key] = pos[0]
+        if not is_compiling:
+            self.cache[cache_key] = pos[0]
         return pos
 
 

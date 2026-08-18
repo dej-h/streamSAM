@@ -9,3 +9,4 @@ _C.*
 outputs/*
 coreml_models/*
 checkpoints/*.pt
+benchmark_artifacts/
