@@ -10,7 +10,17 @@ from collections import OrderedDict
 import torch
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
-from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
+from sam2.utils.gpu_frame_stager import (
+    DEFAULT_GPU_STAGING_SLOT_COUNT,
+    GpuFrameLease,
+    GpuFrameStager,
+)
+from sam2.utils.misc import concat_points, fill_holes_in_mask_scores
+from sam2.utils.video_stream import (
+    FrameLoadingMode,
+    FrameSource,
+    create_video_frame_source,
+)
 
 from tqdm import tqdm
 
@@ -43,23 +53,32 @@ class SAM2VideoPredictor(SAM2Base):
     @torch.inference_mode()
     def init_state(
         self,
-        video_path,
-        offload_video_to_cpu=False,
-        offload_state_to_cpu=False,
-        async_loading_frames=False,
+        video_path: str | bytes,
+        offload_video_to_cpu: bool = False,
+        offload_state_to_cpu: bool = False,
+        async_loading_frames: bool = False,
+        frame_loading: FrameLoadingMode = "eager",
+        frame_buffer_size: int = 4,
+        enable_gpu_frame_staging: bool = True,
+        gpu_frame_staging_slots: int = DEFAULT_GPU_STAGING_SLOT_COUNT,
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
-        images, video_height, video_width = load_video_frames(
+        if frame_loading == "lazy":
+            offload_video_to_cpu = True
+        frame_source = create_video_frame_source(
             video_path=video_path,
             image_size=self.image_size,
             offload_video_to_cpu=offload_video_to_cpu,
+            loading_mode=frame_loading,
+            buffer_capacity=frame_buffer_size,
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
         )
         inference_state = {}
-        inference_state["images"] = images
-        inference_state["num_frames"] = len(images)
+        inference_state["images"] = frame_source
+        inference_state["frame_source"] = frame_source
+        inference_state["num_frames"] = len(frame_source)
         # whether to offload the video frames to CPU memory
         # turning on this option saves the GPU memory with only a very small overhead
         inference_state["offload_video_to_cpu"] = offload_video_to_cpu
@@ -69,9 +88,21 @@ class SAM2VideoPredictor(SAM2Base):
         # and from 24 to 21 when tracking two objects)
         inference_state["offload_state_to_cpu"] = offload_state_to_cpu
         # the original video height and width, used for resizing final output scores
-        inference_state["video_height"] = video_height
-        inference_state["video_width"] = video_width
+        inference_state["video_height"] = frame_source.metadata.video_height
+        inference_state["video_width"] = frame_source.metadata.video_width
         inference_state["device"] = compute_device
+        inference_state["frame_stager"] = (
+            GpuFrameStager(
+                frame_source=frame_source,
+                device=compute_device,
+                slot_count=gpu_frame_staging_slots,
+            )
+            if frame_loading == "lazy"
+            and enable_gpu_frame_staging
+            and compute_device.type == "cuda"
+            else None
+        )
+        inference_state["active_frame_lease"] = None
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
         else:
@@ -109,6 +140,18 @@ class SAM2VideoPredictor(SAM2Base):
         # Warm up the visual backbone and cache the image feature on frame 0
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         return inference_state
+
+    def close_video_source(self, inference_state) -> None:
+        active_frame_lease = inference_state.get("active_frame_lease")
+        if isinstance(active_frame_lease, GpuFrameLease):
+            active_frame_lease.release()
+            inference_state["active_frame_lease"] = None
+        frame_stager = inference_state.get("frame_stager")
+        if isinstance(frame_stager, GpuFrameStager):
+            frame_stager.close()
+        frame_source = inference_state.get("frame_source")
+        if isinstance(frame_source, FrameSource):
+            frame_source.close()
 
     @classmethod
     def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2VideoPredictor":
@@ -885,7 +928,24 @@ class SAM2VideoPredictor(SAM2Base):
         if backbone_out is None:
             # Cache miss -- we will run inference on a single image
             device = inference_state["device"]
-            image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
+            active_frame_lease = inference_state.get("active_frame_lease")
+            if isinstance(active_frame_lease, GpuFrameLease):
+                active_frame_lease.release()
+                inference_state["active_frame_lease"] = None
+
+            frame_stager = inference_state.get("frame_stager")
+            if isinstance(frame_stager, GpuFrameStager):
+                active_frame_lease = frame_stager.acquire(frame_idx)
+                inference_state["active_frame_lease"] = active_frame_lease
+                frame_stager.prefetch_adjacent(frame_idx)
+                image = active_frame_lease.tensor.float().unsqueeze(0)
+            else:
+                image = (
+                    inference_state["images"][frame_idx]
+                    .to(device)
+                    .float()
+                    .unsqueeze(0)
+                )
             backbone_out = self.forward_image(image)
             # Cache the most recent frame's feature (for repeated interactions with
             # a frame; we can use an LRU cache for more frames in the future).

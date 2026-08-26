@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title description">
+  <title id="title">SAM2 bounded GPU frame staging timeline</title>
+  <description id="description">Concurrent decoder, staging, CUDA transfer and CUDA inference lanes using two reusable frame slots.</description>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f5f1e8"/>
+      <stop offset="1" stop-color="#e8f0ec"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#21352f"/>
+    </marker>
+    <style>
+      .title { font: 700 30px Georgia, serif; fill: #172720; }
+      .subtitle { font: 16px Georgia, serif; fill: #4b5d55; }
+      .lane { font: 700 16px Georgia, serif; fill: #21352f; }
+      .label { font: 600 14px Georgia, serif; fill: #172720; }
+      .small { font: 13px Georgia, serif; fill: #3f5149; }
+      .axis { stroke: #8da096; stroke-width: 1; }
+      .guide { stroke: #b8c5be; stroke-width: 1; stroke-dasharray: 5 6; }
+      .arrow { stroke: #21352f; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1280" height="720" fill="url(#background)"/>
+  <text x="54" y="58" class="title">SAM2 bounded GPU frame staging</text>
+  <text x="54" y="86" class="subtitle">Two slots alternate while decode, H2D and ordered temporal inference overlap.</text>
+
+  <line x1="250" y1="132" x2="1220" y2="132" class="axis"/>
+  <text x="250" y="120" class="small">time</text>
+  <line x1="450" y1="126" x2="450" y2="618" class="guide"/>
+  <line x1="690" y1="126" x2="690" y2="618" class="guide"/>
+  <line x1="930" y1="126" x2="930" y2="618" class="guide"/>
+
+  <text x="54" y="186" class="lane">Decoder thread</text>
+  <text x="54" y="286" class="lane">Staging thread</text>
+  <text x="54" y="386" class="lane">CUDA transfer stream</text>
+  <text x="54" y="486" class="lane">CUDA inference stream</text>
+  <text x="54" y="586" class="lane">Slot ownership</text>
+
+  <rect x="270" y="154" width="210" height="54" rx="9" fill="#e8a44c"/>
+  <text x="294" y="187" class="label">decode + normalize n</text>
+  <rect x="500" y="154" width="210" height="54" rx="9" fill="#f0c477"/>
+  <text x="515" y="187" class="label">decode + normalize n+1</text>
+  <rect x="740" y="154" width="210" height="54" rx="9" fill="#e8a44c"/>
+  <text x="759" y="187" class="label">decode + normalize n+2</text>
+
+  <rect x="360" y="254" width="150" height="54" rx="9" fill="#6eb19a"/>
+  <text x="380" y="287" class="label">CPU copy n, A</text>
+  <rect x="600" y="254" width="170" height="54" rx="9" fill="#8bc5b1"/>
+  <text x="617" y="287" class="label">CPU copy n+1, B</text>
+  <rect x="840" y="254" width="170" height="54" rx="9" fill="#6eb19a"/>
+  <text x="857" y="287" class="label">CPU copy n+2, A</text>
+
+  <rect x="415" y="354" width="110" height="54" rx="9" fill="#397a80"/>
+  <text x="440" y="387" class="label" fill="#ffffff">H2D n</text>
+  <rect x="655" y="354" width="130" height="54" rx="9" fill="#559296"/>
+  <text x="674" y="387" class="label" fill="#ffffff">H2D n+1</text>
+  <rect x="895" y="354" width="130" height="54" rx="9" fill="#397a80"/>
+  <text x="914" y="387" class="label" fill="#ffffff">H2D n+2</text>
+
+  <rect x="500" y="454" width="230" height="54" rx="9" fill="#d76545"/>
+  <text x="529" y="487" class="label">SAM2 inference frame n</text>
+  <rect x="740" y="454" width="230" height="54" rx="9" fill="#df8063"/>
+  <text x="759" y="487" class="label">SAM2 inference frame n+1</text>
+  <rect x="980" y="454" width="220" height="54" rx="9" fill="#d76545"/>
+  <text x="997" y="487" class="label">SAM2 inference frame n+2</text>
+
+  <path d="M525 381 C545 415, 520 430, 520 454" class="arrow"/>
+  <text x="530" y="433" class="small">copy_ready[n]</text>
+  <path d="M785 381 C805 415, 760 430, 760 454" class="arrow"/>
+  <text x="790" y="433" class="small">copy_ready[n+1]</text>
+
+  <rect x="270" y="554" width="220" height="54" rx="9" fill="#c9ddd4" stroke="#397a80" stroke-width="2"/>
+  <text x="298" y="587" class="label">slot A: frame n in use</text>
+  <rect x="500" y="554" width="220" height="54" rx="9" fill="#dce9e3" stroke="#55a085" stroke-width="2"/>
+  <text x="523" y="587" class="label">slot B: frame n+1 ready</text>
+  <rect x="740" y="554" width="220" height="54" rx="9" fill="#c9ddd4" stroke="#397a80" stroke-width="2"/>
+  <text x="756" y="587" class="label">slot A: reused for n+2</text>
+
+  <path d="M700 508 C700 530, 715 535, 740 554" class="arrow"/>
+  <text x="570" y="536" class="small">consumed[n] allows slot A reuse</text>
+
+  <rect x="54" y="645" width="1170" height="42" rx="8" fill="#172720"/>
+  <text x="76" y="672" font-family="Georgia, serif" font-size="15" fill="#f5f1e8">Fixed memory: 2 pageable queue positions + 2 pinned slots + 2 GPU slots. SAM2 temporal inference remains ordered.</text>
+</svg>

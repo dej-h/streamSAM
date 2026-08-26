@@ -39,9 +39,11 @@ from benchmarks.video_benchmark_metrics import (
 )
 from sam2.build_sam import build_sam2_video_predictor
 from sam2.sam2_video_predictor import SAM2VideoPredictor
+from sam2.utils.gpu_frame_stager import GpuFrameStager, GpuFrameStagerStats
+from sam2.utils.video_stream import FrameSourceStats
 
 
-BenchmarkMode = Literal["core-eager", "demo-chunked"]
+BenchmarkMode = Literal["core-eager", "core-lazy", "demo-chunked"]
 DTypeName = Literal["float32", "float16", "bfloat16"]
 LiveMetricPayload = MemorySample | FrameTrace | RunSummary
 
@@ -157,6 +159,7 @@ class CliArguments:
     device: torch.device
     dtype_name: DTypeName
     compile_image_encoder: bool
+    frame_buffer_size: int
     max_frames: int | None
     warmup_frames: int
     repeats: int
@@ -204,6 +207,8 @@ class ModeResult:
     propagation_seconds: float
     output_encode_seconds: float
     measured_pipeline_seconds: float
+    frame_source_stats: tuple[FrameSourceStats, ...]
+    frame_stager_stats: tuple[GpuFrameStagerStats, ...] = ()
 
 
 def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
@@ -211,7 +216,9 @@ def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
         description="Measure the existing eager EdgeTAM video paths before streaming changes."
     )
     parser.add_argument(
-        "--mode", choices=("core-eager", "demo-chunked"), required=True
+        "--mode",
+        choices=("core-eager", "core-lazy", "demo-chunked"),
+        required=True,
     )
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--model-config", required=True)
@@ -229,6 +236,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
         action="store_true",
         help="compile the image encoder with the model's torch.compile configuration",
     )
+    parser.add_argument("--frame-buffer-size", type=PositiveInteger, default=4)
     parser.add_argument("--max-frames", type=PositiveInteger)
     parser.add_argument(
         "--warmup-frames",
@@ -267,6 +275,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
         device=torch.device(namespace.device),
         dtype_name=cast(DTypeName, namespace.dtype),
         compile_image_encoder=namespace.compile_image_encoder,
+        frame_buffer_size=namespace.frame_buffer_size,
         max_frames=namespace.max_frames,
         warmup_frames=namespace.warmup_frames,
         repeats=namespace.repeats,
@@ -406,6 +415,8 @@ def run_core_eager(
         video_path=str(arguments.video_path),
         offload_video_to_cpu=arguments.offload_video_to_cpu,
         offload_state_to_cpu=arguments.offload_state_to_cpu,
+        frame_loading="lazy" if arguments.mode == "core-lazy" else "eager",
+        frame_buffer_size=arguments.frame_buffer_size,
     )
     init_seconds = time.perf_counter() - init_started_at
     sampler.capture("post_init")
@@ -446,6 +457,12 @@ def run_core_eager(
         iterator.close()
     propagation_seconds = time.perf_counter() - propagation_started_at
     predictor.reset_state(state)
+    predictor.close_video_source(state)
+    frame_source_stats = (state["frame_source"].stats(),)
+    frame_stager = state.get("frame_stager")
+    frame_stager_stats = (
+        (frame_stager.stats(),) if isinstance(frame_stager, GpuFrameStager) else ()
+    )
     sampler.capture("run_complete", traces[-1].global_frame_idx if traces else None)
     return ModeResult(
         traces=tuple(traces),
@@ -455,6 +472,8 @@ def run_core_eager(
         propagation_seconds=propagation_seconds,
         output_encode_seconds=0.0,
         measured_pipeline_seconds=time.perf_counter() - pipeline_started_at,
+        frame_source_stats=frame_source_stats,
+        frame_stager_stats=frame_stager_stats,
     )
 
 
@@ -583,6 +602,7 @@ def run_demo_chunked(
     propagation_seconds = 0.0
     output_seconds = 0.0
     global_offset = 0
+    frame_source_stats: list[FrameSourceStats] = []
     try:
         for chunk_idx, chunk in enumerate(prepared.chunks):
             init_started_at = time.perf_counter()
@@ -666,6 +686,8 @@ def run_demo_chunked(
                 iterator.close()
                 source_capture.release()
             predictor.reset_state(state)
+            predictor.close_video_source(state)
+            frame_source_stats.append(state["frame_source"].stats())
             global_offset += chunk.frame_count
     finally:
         output_writer.release()
@@ -678,6 +700,7 @@ def run_demo_chunked(
         propagation_seconds=propagation_seconds,
         output_encode_seconds=output_seconds,
         measured_pipeline_seconds=time.perf_counter() - pipeline_started_at,
+        frame_source_stats=tuple(frame_source_stats),
     )
 
 
@@ -689,12 +712,22 @@ def write_run_artifacts(
     traces: Sequence[FrameTrace],
     samples: Sequence[MemorySample],
     summary: RunSummary,
+    frame_source_stats: Sequence[FrameSourceStats],
+    frame_stager_stats: Sequence[GpuFrameStagerStats],
 ) -> None:
     validate_run_artifacts(summary, traces, samples)
     write_json(run_directory / "config.json", config)
     write_json(run_directory / "metadata.json", metadata)
     write_jsonl(run_directory / "frames.jsonl", traces)
     write_jsonl(run_directory / "memory.jsonl", samples)
+    write_json(
+        run_directory / "frame_sources.json",
+        tuple(asdict(stats) for stats in frame_source_stats),
+    )
+    write_json(
+        run_directory / "frame_stagers.json",
+        tuple(asdict(stats) for stats in frame_stager_stats),
+    )
     write_json(run_directory / "summary.json", summary)
 
 
@@ -719,6 +752,7 @@ def execute_repeat(
         device=str(arguments.device),
         dtype=arguments.dtype_name,
         compile_image_encoder=arguments.compile_image_encoder,
+        frame_buffer_size=arguments.frame_buffer_size,
         max_frames=arguments.max_frames,
         warmup_frames=arguments.warmup_frames,
         repeat_index=repeat_index,
@@ -745,7 +779,7 @@ def execute_repeat(
     mode_result: ModeResult | None = None
     try:
         with inference_context(arguments.device, torch_dtype(arguments.dtype_name)):
-            if arguments.mode == "core-eager":
+            if arguments.mode in ("core-eager", "core-lazy"):
                 mode_result = run_core_eager(
                     predictor=predictor,
                     arguments=arguments,
@@ -819,6 +853,12 @@ def execute_repeat(
         traces=traces,
         samples=samples,
         summary=summary,
+        frame_source_stats=(
+            mode_result.frame_source_stats if mode_result is not None else ()
+        ),
+        frame_stager_stats=(
+            mode_result.frame_stager_stats if mode_result is not None else ()
+        ),
     )
     if status == "failed":
         raise RuntimeError(

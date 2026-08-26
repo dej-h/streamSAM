@@ -76,6 +76,7 @@ class BenchmarkConfig:
     device: str
     dtype: str
     compile_image_encoder: bool
+    frame_buffer_size: int
     max_frames: int | None
     warmup_frames: int
     repeat_index: int
