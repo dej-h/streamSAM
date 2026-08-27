@@ -10,7 +10,10 @@ import torch.nn.functional as F
 
 from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
-from sam2.modeling.sam.transformer import TwoWayTransformer
+from sam2.modeling.sam.transformer import (
+    configure_compiled_sdpa_backends,
+    TwoWayTransformer,
+)
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 
 from torch.nn.init import trunc_normal_
@@ -93,6 +96,8 @@ class SAM2Base(torch.nn.Module):
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
+        compile_video_pipeline: bool = False,
+        compile_mask_decoder: bool = False,
         # perceiver
         spatial_perceiver=None,
     ):
@@ -187,17 +192,66 @@ class SAM2Base(torch.nn.Module):
         self.spatial_perceiver = spatial_perceiver
 
         # Model compilation
-        if compile_image_encoder:
-            # Compile the forward function (not the full module) to allow loading checkpoints.
+        self.compile_video_pipeline_enabled = compile_video_pipeline
+        if compile_video_pipeline:
+            print(
+                "Video tensor pipeline compilation is enabled. First calls will be slow."
+            )
+            configure_compiled_sdpa_backends()
+            self._compile_module_forward(
+                self.image_encoder, dynamic=False, use_cuda_graphs=True
+            )
+            # Memory token counts vary as object pointers accumulate, while prompt
+            # and mask shapes come from a small finite set of interaction modes.
+            self._compile_module_forward(
+                self.memory_attention, dynamic=True, use_cuda_graphs=False
+            )
+            self._compile_module_forward(
+                self.sam_prompt_encoder, dynamic=False, use_cuda_graphs=False
+            )
+            if compile_mask_decoder:
+                # Experimental: compiling the decoder materially changes masks
+                # for small or unstable objects. Keep it outside the default
+                # fidelity-cleared pipeline until that drift is resolved.
+                self._compile_module_forward(
+                    self.sam_mask_decoder, dynamic=False, use_cuda_graphs=False
+                )
+            self._compile_module_forward(
+                self.memory_encoder, dynamic=False, use_cuda_graphs=False
+            )
+            if self.spatial_perceiver is not None:
+                self._compile_module_forward(
+                    self.spatial_perceiver,
+                    dynamic=False,
+                    use_cuda_graphs=False,
+                )
+        elif compile_image_encoder:
             print(
                 "Image encoder compilation is enabled. First forward pass will be slow."
             )
-            self.image_encoder.forward = torch.compile(
-                self.image_encoder.forward,
-                mode="max-autotune",
-                fullgraph=True,
-                dynamic=False,
+            self._compile_module_forward(
+                self.image_encoder, dynamic=False, use_cuda_graphs=True
             )
+
+    @staticmethod
+    def _compile_module_forward(
+        module: torch.nn.Module,
+        *,
+        dynamic: bool,
+        use_cuda_graphs: bool,
+    ) -> None:
+        # Compiling module forwards keeps checkpoint/state ownership in the original
+        # modules while excluding the predictor's dynamic Python state dictionaries.
+        module.forward = torch.compile(
+            module.forward,
+            mode=(
+                "max-autotune"
+                if use_cuda_graphs
+                else "max-autotune-no-cudagraphs"
+            ),
+            fullgraph=True,
+            dynamic=dynamic,
+        )
 
     @property
     def device(self):

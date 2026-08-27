@@ -4,8 +4,10 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import warnings
 from collections import OrderedDict
+from typing import Final
 
 import torch
 
@@ -15,6 +17,11 @@ from sam2.utils.gpu_frame_stager import (
     GpuFrameLease,
     GpuFrameStager,
 )
+from sam2.utils.gpu_image_feature_pipeline import (
+    EncodedImageFeature,
+    GpuImageFeaturePipeline,
+)
+from sam2.utils.gpu_stage_profiler import GpuStageProfiler
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores
 from sam2.utils.video_stream import (
     FrameLoadingMode,
@@ -23,6 +30,12 @@ from sam2.utils.video_stream import (
 )
 
 from tqdm import tqdm
+
+
+# Full pipeline compilation creates one memory-attention graph for the first tracked
+# frame and a second graph once object-pointer memory is present. Launching the image
+# encoder from another Python thread during those cold compiles can deadlock Inductor.
+FULL_PIPELINE_CONCURRENCY_WARMUP_FRAMES: Final = 2
 
 
 class SAM2VideoPredictor(SAM2Base):
@@ -61,6 +74,8 @@ class SAM2VideoPredictor(SAM2Base):
         frame_buffer_size: int = 4,
         enable_gpu_frame_staging: bool = True,
         gpu_frame_staging_slots: int = DEFAULT_GPU_STAGING_SLOT_COUNT,
+        enable_concurrent_image_encoder: bool = False,
+        gpu_stage_profiler: GpuStageProfiler | None = None,
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
@@ -103,6 +118,7 @@ class SAM2VideoPredictor(SAM2Base):
             else None
         )
         inference_state["active_frame_lease"] = None
+        inference_state["gpu_stage_profiler"] = gpu_stage_profiler
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
         else:
@@ -137,11 +153,39 @@ class SAM2VideoPredictor(SAM2Base):
         # metadata for each tracking frame (e.g. which direction it's tracked)
         inference_state["tracking_has_started"] = False
         inference_state["frames_already_tracked"] = {}
+        if enable_concurrent_image_encoder:
+            if not isinstance(inference_state["frame_stager"], GpuFrameStager):
+                raise ValueError(
+                    "concurrent image encoding requires lazy CUDA frame staging"
+                )
+            inference_state["feature_pipeline"] = GpuImageFeaturePipeline(
+                producer=lambda frame_idx: self._encode_image_feature(
+                    inference_state,
+                    frame_idx,
+                    preserve_compiled_outputs=True,
+                ),
+                frame_count=inference_state["num_frames"],
+                device=compute_device,
+                autocast_enabled=torch.is_autocast_enabled("cuda"),
+                autocast_dtype=torch.get_autocast_dtype("cuda"),
+                profiler=gpu_stage_profiler,
+            )
+        else:
+            inference_state["feature_pipeline"] = None
+        inference_state["concurrent_encoder_warmup_frames_remaining"] = (
+            FULL_PIPELINE_CONCURRENCY_WARMUP_FRAMES
+            if enable_concurrent_image_encoder
+            and self.compile_video_pipeline_enabled
+            else 0
+        )
         # Warm up the visual backbone and cache the image feature on frame 0
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         return inference_state
 
     def close_video_source(self, inference_state) -> None:
+        feature_pipeline = inference_state.get("feature_pipeline")
+        if isinstance(feature_pipeline, GpuImageFeaturePipeline):
+            feature_pipeline.close()
         active_frame_lease = inference_state.get("active_frame_lease")
         if isinstance(active_frame_lease, GpuFrameLease):
             active_frame_lease.release()
@@ -771,6 +815,7 @@ class SAM2VideoPredictor(SAM2Base):
                     mask_inputs=None,
                     reverse=reverse,
                     run_mem_encoder=True,
+                    prefetch_frame_idx=(frame_idx - 1 if reverse else frame_idx + 1),
                 )
                 output_dict[storage_key][frame_idx] = current_out
             # Create slices of per-object outputs for subsequent interaction with each
@@ -933,20 +978,23 @@ class SAM2VideoPredictor(SAM2Base):
                 active_frame_lease.release()
                 inference_state["active_frame_lease"] = None
 
-            frame_stager = inference_state.get("frame_stager")
-            if isinstance(frame_stager, GpuFrameStager):
-                active_frame_lease = frame_stager.acquire(frame_idx)
-                inference_state["active_frame_lease"] = active_frame_lease
-                frame_stager.prefetch_adjacent(frame_idx)
-                image = active_frame_lease.tensor.float().unsqueeze(0)
+            feature_pipeline = inference_state.get("feature_pipeline")
+            if isinstance(feature_pipeline, GpuImageFeaturePipeline):
+                encoded_feature = feature_pipeline.acquire(frame_idx)
             else:
-                image = (
-                    inference_state["images"][frame_idx]
-                    .to(device)
-                    .float()
-                    .unsqueeze(0)
+                profiler = inference_state.get("gpu_stage_profiler")
+                profile_context = (
+                    profiler.frame(frame_idx, "demand")
+                    if isinstance(profiler, GpuStageProfiler)
+                    else contextlib.nullcontext()
                 )
-            backbone_out = self.forward_image(image)
+                with profile_context:
+                    encoded_feature = self._encode_image_feature(
+                        inference_state, frame_idx
+                    )
+            image = encoded_feature.image
+            backbone_out = encoded_feature.backbone_out
+            inference_state["active_frame_lease"] = encoded_feature.frame_lease
             # Cache the most recent frame's feature (for repeated interactions with
             # a frame; we can use an LRU cache for more frames in the future).
             inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
@@ -969,6 +1017,51 @@ class SAM2VideoPredictor(SAM2Base):
         features = (expanded_image,) + features
         return features
 
+    def _encode_image_feature(
+        self,
+        inference_state,
+        frame_idx: int,
+        *,
+        preserve_compiled_outputs: bool = False,
+    ) -> EncodedImageFeature:
+        frame_lease: GpuFrameLease | None = None
+        try:
+            frame_stager = inference_state.get("frame_stager")
+            if isinstance(frame_stager, GpuFrameStager):
+                frame_lease = frame_stager.acquire(frame_idx)
+                frame_stager.prefetch_adjacent(frame_idx)
+                image = frame_lease.tensor.float().unsqueeze(0)
+            else:
+                image = (
+                    inference_state["images"][frame_idx]
+                    .to(inference_state["device"])
+                    .float()
+                    .unsqueeze(0)
+                )
+            backbone_out = self.forward_image(image)
+            if preserve_compiled_outputs:
+                # torch.compile may use CUDAGraph output buffers that are overwritten
+                # by the next invocation. Concurrent prefetch keeps the current frame's
+                # features live, so publish independently owned tensors instead.
+                backbone_out = {
+                    "backbone_fpn": [
+                        tensor.clone() for tensor in backbone_out["backbone_fpn"]
+                    ],
+                    "vision_pos_enc": [
+                        tensor.clone() for tensor in backbone_out["vision_pos_enc"]
+                    ],
+                }
+            return EncodedImageFeature(
+                frame_idx=frame_idx,
+                image=image,
+                backbone_out=backbone_out,
+                frame_lease=frame_lease,
+            )
+        except BaseException:
+            if frame_lease is not None:
+                frame_lease.release()
+            raise
+
     def _run_single_frame_inference(
         self,
         inference_state,
@@ -981,33 +1074,54 @@ class SAM2VideoPredictor(SAM2Base):
         reverse,
         run_mem_encoder,
         prev_sam_mask_logits=None,
+        prefetch_frame_idx: int | None = None,
     ):
         """Run tracking on a single frame based on current inputs and previous memory."""
-        # Retrieve correct image features
-        (
-            _,
-            _,
-            current_vision_feats,
-            current_vision_pos_embeds,
-            feat_sizes,
-        ) = self._get_image_feature(inference_state, frame_idx, batch_size)
-
-        # point and mask should not appear as input simultaneously on the same frame
-        assert point_inputs is None or mask_inputs is None
-        current_out = self.track_step(
-            frame_idx=frame_idx,
-            is_init_cond_frame=is_init_cond_frame,
-            current_vision_feats=current_vision_feats,
-            current_vision_pos_embeds=current_vision_pos_embeds,
-            feat_sizes=feat_sizes,
-            point_inputs=point_inputs,
-            mask_inputs=mask_inputs,
-            output_dict=output_dict,
-            num_frames=inference_state["num_frames"],
-            track_in_reverse=reverse,
-            run_mem_encoder=run_mem_encoder,
-            prev_sam_mask_logits=prev_sam_mask_logits,
+        profiler = inference_state.get("gpu_stage_profiler")
+        profile_role = "prompt" if point_inputs is not None or mask_inputs is not None else "tracking"
+        profile_context = (
+            profiler.frame(frame_idx, profile_role)
+            if isinstance(profiler, GpuStageProfiler)
+            else contextlib.nullcontext()
         )
+        with profile_context:
+            # Retrieve correct image features before launching the independent next
+            # frame encoder, then enqueue recurrent tracking work on this stream.
+            (
+                _,
+                _,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+            ) = self._get_image_feature(inference_state, frame_idx, batch_size)
+            feature_pipeline = inference_state.get("feature_pipeline")
+            if isinstance(feature_pipeline, GpuImageFeaturePipeline):
+                warmup_frames_remaining = inference_state[
+                    "concurrent_encoder_warmup_frames_remaining"
+                ]
+                if profile_role == "tracking" and warmup_frames_remaining > 0:
+                    inference_state[
+                        "concurrent_encoder_warmup_frames_remaining"
+                    ] = warmup_frames_remaining - 1
+                elif prefetch_frame_idx is not None:
+                    feature_pipeline.prefetch(prefetch_frame_idx)
+
+            # point and mask should not appear as input simultaneously on the same frame
+            assert point_inputs is None or mask_inputs is None
+            current_out = self.track_step(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                point_inputs=point_inputs,
+                mask_inputs=mask_inputs,
+                output_dict=output_dict,
+                num_frames=inference_state["num_frames"],
+                track_in_reverse=reverse,
+                run_mem_encoder=run_mem_encoder,
+                prev_sam_mask_logits=prev_sam_mask_logits,
+            )
 
         # optionally offload the output to CPU memory to save GPU space
         storage_device = inference_state["storage_device"]

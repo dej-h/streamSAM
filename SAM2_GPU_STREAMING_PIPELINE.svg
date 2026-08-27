@@ -1,85 +1,141 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title description">
-  <title id="title">SAM2 bounded GPU frame staging timeline</title>
-  <description id="description">Concurrent decoder, staging, CUDA transfer and CUDA inference lanes using two reusable frame slots.</description>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="960" viewBox="0 0 1400 960" role="img" aria-labelledby="title description">
+  <title id="title">Measured SAM2 bounded GPU streaming pipeline</title>
+  <description id="description">CPU decode and transfer lanes feed optional concurrent image encoding. Measured GPU timelines compare safe sequential and concurrent compiled inference.</description>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#f5f1e8"/>
-      <stop offset="1" stop-color="#e8f0ec"/>
+      <stop offset="0" stop-color="#f7f1e4"/>
+      <stop offset="0.55" stop-color="#eaf1eb"/>
+      <stop offset="1" stop-color="#e4edf0"/>
     </linearGradient>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M 28 0 L 0 0 0 28" fill="none" stroke="#1d352d" stroke-opacity="0.045" stroke-width="1"/>
+    </pattern>
     <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
       <path d="M0,0 L10,4 L0,8 Z" fill="#21352f"/>
     </marker>
     <style>
-      .title { font: 700 30px Georgia, serif; fill: #172720; }
+      .title { font: 700 31px Georgia, serif; fill: #172720; }
       .subtitle { font: 16px Georgia, serif; fill: #4b5d55; }
-      .lane { font: 700 16px Georgia, serif; fill: #21352f; }
-      .label { font: 600 14px Georgia, serif; fill: #172720; }
-      .small { font: 13px Georgia, serif; fill: #3f5149; }
-      .axis { stroke: #8da096; stroke-width: 1; }
-      .guide { stroke: #b8c5be; stroke-width: 1; stroke-dasharray: 5 6; }
-      .arrow { stroke: #21352f; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .section { font: 700 19px Georgia, serif; fill: #172720; }
+      .lane { font: 700 14px Georgia, serif; fill: #21352f; }
+      .label { font: 700 13px Georgia, serif; fill: #172720; }
+      .inside { font: 700 12px Georgia, serif; fill: #fffdf7; }
+      .small { font: 12px Georgia, serif; fill: #3f5149; }
+      .metric { font: 700 14px Georgia, serif; fill: #172720; }
+      .axis { stroke: #81968c; stroke-width: 1; }
+      .event { stroke: #21352f; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
     </style>
   </defs>
 
-  <rect width="1280" height="720" fill="url(#background)"/>
-  <text x="54" y="58" class="title">SAM2 bounded GPU frame staging</text>
-  <text x="54" y="86" class="subtitle">Two slots alternate while decode, H2D and ordered temporal inference overlap.</text>
+  <rect width="1400" height="960" fill="url(#background)"/>
+  <rect width="1400" height="960" fill="url(#grid)"/>
+  <text x="54" y="54" class="title">SAM2 streaming, measured at the GPU boundary</text>
+  <text x="54" y="82" class="subtitle">Bounded CPU preparation succeeds; competing CUDA streams do not increase throughput on this GPU.</text>
 
-  <line x1="250" y1="132" x2="1220" y2="132" class="axis"/>
-  <text x="250" y="120" class="small">time</text>
-  <line x1="450" y1="126" x2="450" y2="618" class="guide"/>
-  <line x1="690" y1="126" x2="690" y2="618" class="guide"/>
-  <line x1="930" y1="126" x2="930" y2="618" class="guide"/>
+  <rect x="42" y="112" width="1316" height="308" rx="18" fill="#fffdf8" fill-opacity="0.74" stroke="#b8c7bf"/>
+  <text x="64" y="145" class="section">Bounded producer pipeline</text>
+  <text x="1160" y="145" class="small">capacity is fixed</text>
 
-  <text x="54" y="186" class="lane">Decoder thread</text>
-  <text x="54" y="286" class="lane">Staging thread</text>
-  <text x="54" y="386" class="lane">CUDA transfer stream</text>
-  <text x="54" y="486" class="lane">CUDA inference stream</text>
-  <text x="54" y="586" class="lane">Slot ownership</text>
+  <text x="64" y="193" class="lane">Decoder thread</text>
+  <text x="64" y="248" class="lane">Staging thread</text>
+  <text x="64" y="303" class="lane">CUDA transfer</text>
+  <text x="64" y="358" class="lane">Feature worker</text>
 
-  <rect x="270" y="154" width="210" height="54" rx="9" fill="#e8a44c"/>
-  <text x="294" y="187" class="label">decode + normalize n</text>
-  <rect x="500" y="154" width="210" height="54" rx="9" fill="#f0c477"/>
-  <text x="515" y="187" class="label">decode + normalize n+1</text>
-  <rect x="740" y="154" width="210" height="54" rx="9" fill="#e8a44c"/>
-  <text x="759" y="187" class="label">decode + normalize n+2</text>
+  <line x1="225" y1="176" x2="1320" y2="176" class="axis"/>
+  <line x1="225" y1="231" x2="1320" y2="231" class="axis"/>
+  <line x1="225" y1="286" x2="1320" y2="286" class="axis"/>
+  <line x1="225" y1="341" x2="1320" y2="341" class="axis"/>
 
-  <rect x="360" y="254" width="150" height="54" rx="9" fill="#6eb19a"/>
-  <text x="380" y="287" class="label">CPU copy n, A</text>
-  <rect x="600" y="254" width="170" height="54" rx="9" fill="#8bc5b1"/>
-  <text x="617" y="287" class="label">CPU copy n+1, B</text>
-  <rect x="840" y="254" width="170" height="54" rx="9" fill="#6eb19a"/>
-  <text x="857" y="287" class="label">CPU copy n+2, A</text>
+  <rect x="250" y="160" width="224" height="34" rx="7" fill="#df9b3f"/>
+  <text x="278" y="182" class="label">decode + normalize n+1</text>
+  <rect x="500" y="160" width="224" height="34" rx="7" fill="#efc06d"/>
+  <text x="528" y="182" class="label">decode + normalize n+2</text>
 
-  <rect x="415" y="354" width="110" height="54" rx="9" fill="#397a80"/>
-  <text x="440" y="387" class="label" fill="#ffffff">H2D n</text>
-  <rect x="655" y="354" width="130" height="54" rx="9" fill="#559296"/>
-  <text x="674" y="387" class="label" fill="#ffffff">H2D n+1</text>
-  <rect x="895" y="354" width="130" height="54" rx="9" fill="#397a80"/>
-  <text x="914" y="387" class="label" fill="#ffffff">H2D n+2</text>
+  <rect x="354" y="215" width="182" height="34" rx="7" fill="#73ad93"/>
+  <text x="383" y="237" class="label">pinned slot B copy</text>
+  <rect x="604" y="215" width="182" height="34" rx="7" fill="#9bc6b3"/>
+  <text x="633" y="237" class="label">pinned slot A copy</text>
 
-  <rect x="500" y="454" width="230" height="54" rx="9" fill="#d76545"/>
-  <text x="529" y="487" class="label">SAM2 inference frame n</text>
-  <rect x="740" y="454" width="230" height="54" rx="9" fill="#df8063"/>
-  <text x="759" y="487" class="label">SAM2 inference frame n+1</text>
-  <rect x="980" y="454" width="220" height="54" rx="9" fill="#d76545"/>
-  <text x="997" y="487" class="label">SAM2 inference frame n+2</text>
+  <rect x="438" y="270" width="112" height="34" rx="7" fill="#347881"/>
+  <text x="464" y="292" class="inside">H2D n+1</text>
+  <rect x="688" y="270" width="112" height="34" rx="7" fill="#57969c"/>
+  <text x="714" y="292" class="inside">H2D n+2</text>
 
-  <path d="M525 381 C545 415, 520 430, 520 454" class="arrow"/>
-  <text x="530" y="433" class="small">copy_ready[n]</text>
-  <path d="M785 381 C805 415, 760 430, 760 454" class="arrow"/>
-  <text x="790" y="433" class="small">copy_ready[n+1]</text>
+  <rect x="530" y="325" width="270" height="34" rx="7" fill="#c85f43"/>
+  <text x="566" y="347" class="inside">optional encode features n+1</text>
+  <rect x="850" y="325" width="270" height="34" rx="7" fill="#d77a5f"/>
+  <text x="886" y="347" class="inside">optional encode features n+2</text>
 
-  <rect x="270" y="554" width="220" height="54" rx="9" fill="#c9ddd4" stroke="#397a80" stroke-width="2"/>
-  <text x="298" y="587" class="label">slot A: frame n in use</text>
-  <rect x="500" y="554" width="220" height="54" rx="9" fill="#dce9e3" stroke="#55a085" stroke-width="2"/>
-  <text x="523" y="587" class="label">slot B: frame n+1 ready</text>
-  <rect x="740" y="554" width="220" height="54" rx="9" fill="#c9ddd4" stroke="#397a80" stroke-width="2"/>
-  <text x="756" y="587" class="label">slot A: reused for n+2</text>
+  <path d="M550 287 C570 300, 550 314, 550 325" class="event"/>
+  <text x="562" y="316" class="small">copy_ready</text>
+  <path d="M800 287 C820 300, 870 310, 870 325" class="event"/>
+  <text x="820" y="299" class="small">copy_ready</text>
 
-  <path d="M700 508 C700 530, 715 535, 740 554" class="arrow"/>
-  <text x="570" y="536" class="small">consumed[n] allows slot A reuse</text>
+  <rect x="1138" y="164" width="172" height="185" rx="11" fill="#172720"/>
+  <text x="1158" y="193" font-family="Georgia, serif" font-size="14" font-weight="700" fill="#f7f1e4">Fixed residency</text>
+  <text x="1158" y="222" font-family="Georgia, serif" font-size="13" fill="#d8e6df">CPU queue: 4</text>
+  <text x="1158" y="248" font-family="Georgia, serif" font-size="13" fill="#d8e6df">Pinned slots: 2</text>
+  <text x="1158" y="274" font-family="Georgia, serif" font-size="13" fill="#d8e6df">GPU slots: 2</text>
+  <text x="1158" y="300" font-family="Georgia, serif" font-size="13" fill="#d8e6df">Features: 1</text>
+  <text x="1158" y="330" font-family="Georgia, serif" font-size="12" fill="#8fc0aa">independent of length</text>
 
-  <rect x="54" y="645" width="1170" height="42" rx="8" fill="#172720"/>
-  <text x="76" y="672" font-family="Georgia, serif" font-size="15" fill="#f5f1e8">Fixed memory: 2 pageable queue positions + 2 pinned slots + 2 GPU slots. SAM2 temporal inference remains ordered.</text>
+  <rect x="42" y="442" width="1316" height="452" rx="18" fill="#fffdf8" fill-opacity="0.82" stroke="#b8c7bf"/>
+  <text x="64" y="478" class="section">Warm steady state, 200 frames, warmup 20, BF16</text>
+  <text x="1025" y="478" class="small">RTX 5060 Laptop GPU</text>
+
+  <text x="64" y="528" class="lane">Safe sequential</text>
+  <text x="64" y="554" class="metric">31.82 FPS</text>
+  <line x1="225" y1="526" x2="1285" y2="526" class="axis"/>
+  <rect x="235" y="507" width="218" height="38" rx="6" fill="#c85f43"/>
+  <text x="264" y="531" class="inside">image 8.74 ms</text>
+  <rect x="453" y="507" width="118" height="38" fill="#397a80"/>
+  <text x="464" y="531" class="inside">attn 4.71</text>
+  <rect x="571" y="507" width="45" height="38" fill="#6a9f88"/>
+  <text x="579" y="531" class="inside">P 1.78</text>
+  <rect x="616" y="507" width="180" height="38" fill="#bf704d"/>
+  <text x="636" y="531" class="inside">mask 7.22 ms</text>
+  <rect x="796" y="507" width="67" height="38" fill="#789f58"/>
+  <text x="803" y="531" class="inside">SP 2.67</text>
+  <rect x="863" y="507" width="48" height="38" fill="#b68a45"/>
+  <text x="869" y="531" class="inside">M 1.92</text>
+  <rect x="911" y="507" width="110" height="38" rx="0 6 6 0" fill="#c9d2cd"/>
+  <text x="929" y="531" class="label">other 4.4</text>
+
+  <text x="64" y="628" class="lane">Concurrent streams</text>
+  <text x="64" y="654" class="metric">30.74 FPS</text>
+  <text x="235" y="596" class="small">feature CUDA stream</text>
+  <rect x="235" y="606" width="295" height="34" rx="6" fill="#c85f43"/>
+  <text x="306" y="628" class="inside">image 11.81 ms</text>
+  <text x="545" y="628" class="small">8.60 ms overlaps prior-frame tracking</text>
+
+  <text x="235" y="671" class="small">inference CUDA stream</text>
+  <rect x="235" y="681" width="192" height="38" rx="6 0 0 6" fill="#397a80"/>
+  <text x="270" y="705" class="inside">attn 7.66 ms</text>
+  <rect x="427" y="681" width="72" height="38" fill="#6a9f88"/>
+  <text x="438" y="705" class="inside">P 2.87</text>
+  <rect x="499" y="681" width="182" height="38" fill="#bf704d"/>
+  <text x="519" y="705" class="inside">mask 7.26 ms</text>
+  <rect x="681" y="681" width="66" height="38" fill="#789f58"/>
+  <text x="688" y="705" class="inside">SP 2.62</text>
+  <rect x="747" y="681" width="48" height="38" rx="0 6 6 0" fill="#b68a45"/>
+  <text x="753" y="705" class="inside">M 1.90</text>
+
+  <path d="M270 640 C295 660, 310 661, 330 681" class="event"/>
+  <text x="345" y="662" class="small">same SMs and memory bandwidth</text>
+
+  <rect x="915" y="590" width="390" height="170" rx="12" fill="#f3dfd4" stroke="#c85f43"/>
+  <text x="938" y="622" class="section">Measured contention</text>
+  <text x="938" y="651" class="label">Image encoder</text>
+  <text x="1115" y="651" class="metric">+35%</text>
+  <text x="938" y="679" class="label">Memory attention</text>
+  <text x="1115" y="679" class="metric">+63%</text>
+  <text x="938" y="707" class="label">Prompt encoder</text>
+  <text x="1115" y="707" class="metric">+61%</text>
+  <text x="938" y="739" class="small">Overlap is real; throughput still falls 3.4%.</text>
+
+  <rect x="64" y="785" width="1241" height="78" rx="11" fill="#172720"/>
+  <text x="86" y="814" font-family="Georgia, serif" font-size="15" font-weight="700" fill="#f7f1e4">Next measured targets</text>
+  <text x="86" y="842" font-family="Georgia, serif" font-size="14" fill="#d8e6df">1. image encoder 8.74 ms   2. fidelity-safe mask decoder 7.22 ms   3. dynamic memory attention 4.71 ms   4. split 4.4 ms unattributed cost</text>
+
+  <text x="54" y="930" class="small">Safe video compilation: image + memory attention + prompt + spatial perceiver + memory encoder. Mask decoder compilation remains experimental.</text>
 </svg>

@@ -40,10 +40,25 @@ from benchmarks.video_benchmark_metrics import (
 from sam2.build_sam import build_sam2_video_predictor
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 from sam2.utils.gpu_frame_stager import GpuFrameStager, GpuFrameStagerStats
+from sam2.utils.gpu_image_feature_pipeline import (
+    GpuImageFeaturePipeline,
+    GpuImageFeaturePipelineStats,
+)
+from sam2.utils.gpu_stage_profiler import (
+    GpuStageProfile,
+    GpuStageProfiler,
+    gpu_stage_profile_to_chrome_trace,
+)
 from sam2.utils.video_stream import FrameSourceStats
+from sam2.utils.video_output_writer import (
+    BoundedVideoMaskWriter,
+    VideoOutputWriterStats,
+)
 
 
-BenchmarkMode = Literal["core-eager", "core-lazy", "demo-chunked"]
+BenchmarkMode = Literal[
+    "core-eager", "core-lazy", "demo-chunked", "demo-streaming"
+]
 DTypeName = Literal["float32", "float16", "bfloat16"]
 LiveMetricPayload = MemorySample | FrameTrace | RunSummary
 
@@ -159,6 +174,10 @@ class CliArguments:
     device: torch.device
     dtype_name: DTypeName
     compile_image_encoder: bool
+    compile_video_pipeline: bool
+    compile_mask_decoder: bool
+    concurrent_image_encoder: bool
+    profile_gpu_stages: bool
     frame_buffer_size: int
     max_frames: int | None
     warmup_frames: int
@@ -209,6 +228,9 @@ class ModeResult:
     measured_pipeline_seconds: float
     frame_source_stats: tuple[FrameSourceStats, ...]
     frame_stager_stats: tuple[GpuFrameStagerStats, ...] = ()
+    feature_pipeline_stats: tuple[GpuImageFeaturePipelineStats, ...] = ()
+    output_writer_stats: tuple[VideoOutputWriterStats, ...] = ()
+    gpu_stage_profile: GpuStageProfile | None = None
 
 
 def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
@@ -217,7 +239,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
     )
     parser.add_argument(
         "--mode",
-        choices=("core-eager", "core-lazy", "demo-chunked"),
+        choices=("core-eager", "core-lazy", "demo-chunked", "demo-streaming"),
         required=True,
     )
     parser.add_argument("--video", type=Path, required=True)
@@ -235,6 +257,29 @@ def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
         "--compile-image-encoder",
         action="store_true",
         help="compile the image encoder with the model's torch.compile configuration",
+    )
+    parser.add_argument(
+        "--compile-video-pipeline",
+        action="store_true",
+        help="compile fidelity-cleared tensor-heavy video pipeline modules",
+    )
+    parser.add_argument(
+        "--compile-mask-decoder",
+        action="store_true",
+        help=(
+            "experimentally compile the SAM mask decoder; this is separate because "
+            "it currently changes output masks"
+        ),
+    )
+    parser.add_argument(
+        "--concurrent-image-encoder",
+        action="store_true",
+        help="encode the next lazy frame on a dedicated CUDA stream",
+    )
+    parser.add_argument(
+        "--profile-gpu-stages",
+        action="store_true",
+        help="persist per-stage CUDA event timings, NVTX ranges, and a Chrome trace",
     )
     parser.add_argument("--frame-buffer-size", type=PositiveInteger, default=4)
     parser.add_argument("--max-frames", type=PositiveInteger)
@@ -275,6 +320,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
         device=torch.device(namespace.device),
         dtype_name=cast(DTypeName, namespace.dtype),
         compile_image_encoder=namespace.compile_image_encoder,
+        compile_video_pipeline=namespace.compile_video_pipeline,
+        compile_mask_decoder=namespace.compile_mask_decoder,
+        concurrent_image_encoder=namespace.concurrent_image_encoder,
+        profile_gpu_stages=namespace.profile_gpu_stages,
         frame_buffer_size=namespace.frame_buffer_size,
         max_frames=namespace.max_frames,
         warmup_frames=namespace.warmup_frames,
@@ -299,10 +348,20 @@ def validate_inputs(arguments: CliArguments, prompt: PromptSpec) -> None:
             raise FileNotFoundError(f"{label} file does not exist: {path}")
     if arguments.device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA benchmark requested but CUDA is unavailable")
-    if arguments.mode == "demo-chunked" and prompt.frame_idx != 0:
-        raise ValueError("demo-chunked mode requires a prompt on frame 0")
+    if arguments.mode in ("demo-chunked", "demo-streaming") and prompt.frame_idx != 0:
+        raise ValueError(f"{arguments.mode} mode requires a prompt on frame 0")
     if arguments.max_frames is not None and prompt.frame_idx >= arguments.max_frames:
         raise ValueError("prompt frame is outside --max-frames")
+    if arguments.compile_image_encoder and arguments.compile_video_pipeline:
+        raise ValueError(
+            "choose either --compile-image-encoder or --compile-video-pipeline"
+        )
+    if arguments.compile_mask_decoder and not arguments.compile_video_pipeline:
+        raise ValueError("--compile-mask-decoder requires --compile-video-pipeline")
+    if arguments.concurrent_image_encoder and arguments.mode != "core-lazy":
+        raise ValueError("--concurrent-image-encoder requires --mode core-lazy")
+    if arguments.profile_gpu_stages and arguments.device.type != "cuda":
+        raise ValueError("--profile-gpu-stages requires a CUDA device")
 
 
 def torch_dtype(name: DTypeName) -> torch.dtype:
@@ -333,11 +392,14 @@ def build_predictor(arguments: CliArguments) -> tuple[SAM2VideoPredictor, float]
         arguments.model_config,
         str(arguments.checkpoint_path),
         device=str(arguments.device),
-        hydra_overrides_extra=(
-            ["++model.compile_image_encoder=true"]
-            if arguments.compile_image_encoder
-            else []
-        ),
+        hydra_overrides_extra=[
+            "++model.compile_image_encoder="
+            f"{str(arguments.compile_image_encoder).lower()}",
+            "++model.compile_video_pipeline="
+            f"{str(arguments.compile_video_pipeline).lower()}",
+            "++model.compile_mask_decoder="
+            f"{str(arguments.compile_mask_decoder).lower()}",
+        ],
     )
     if not isinstance(predictor, SAM2VideoPredictor):
         raise TypeError("video predictor builder returned an unexpected model type")
@@ -409,6 +471,23 @@ def run_core_eager(
     sampler: MemorySampler,
     live_reporter: LiveMetricsReporter,
 ) -> ModeResult:
+    gpu_profiler = (
+        GpuStageProfiler(arguments.device)
+        if arguments.profile_gpu_stages
+        else None
+    )
+    if gpu_profiler is not None:
+        profiled_modules = {
+            "image_encoder": predictor.image_encoder,
+            "memory_attention": predictor.memory_attention,
+            "sam_prompt_encoder": predictor.sam_prompt_encoder,
+            "sam_mask_decoder": predictor.sam_mask_decoder,
+            "memory_encoder": predictor.memory_encoder,
+        }
+        if predictor.spatial_perceiver is not None:
+            profiled_modules["spatial_perceiver"] = predictor.spatial_perceiver
+        gpu_profiler.attach(profiled_modules)
+        gpu_profiler.start()
     pipeline_started_at = time.perf_counter()
     init_started_at = time.perf_counter()
     state = predictor.init_state(
@@ -417,6 +496,8 @@ def run_core_eager(
         offload_state_to_cpu=arguments.offload_state_to_cpu,
         frame_loading="lazy" if arguments.mode == "core-lazy" else "eager",
         frame_buffer_size=arguments.frame_buffer_size,
+        enable_concurrent_image_encoder=arguments.concurrent_image_encoder,
+        gpu_stage_profiler=gpu_profiler,
     )
     init_seconds = time.perf_counter() - init_started_at
     sampler.capture("post_init")
@@ -463,6 +544,16 @@ def run_core_eager(
     frame_stager_stats = (
         (frame_stager.stats(),) if isinstance(frame_stager, GpuFrameStager) else ()
     )
+    feature_pipeline = state.get("feature_pipeline")
+    feature_pipeline_stats = (
+        (feature_pipeline.stats(),)
+        if isinstance(feature_pipeline, GpuImageFeaturePipeline)
+        else ()
+    )
+    gpu_stage_profile = None
+    if gpu_profiler is not None:
+        gpu_stage_profile = gpu_profiler.finish()
+        gpu_profiler.detach()
     sampler.capture("run_complete", traces[-1].global_frame_idx if traces else None)
     return ModeResult(
         traces=tuple(traces),
@@ -474,6 +565,8 @@ def run_core_eager(
         measured_pipeline_seconds=time.perf_counter() - pipeline_started_at,
         frame_source_stats=frame_source_stats,
         frame_stager_stats=frame_stager_stats,
+        feature_pipeline_stats=feature_pipeline_stats,
+        gpu_stage_profile=gpu_stage_profile,
     )
 
 
@@ -704,6 +797,112 @@ def run_demo_chunked(
     )
 
 
+def run_demo_streaming(
+    *,
+    predictor: SAM2VideoPredictor,
+    arguments: CliArguments,
+    config: BenchmarkConfig,
+    prompt: PromptSpec,
+    sampler: MemorySampler,
+    live_reporter: LiveMetricsReporter,
+    run_directory: Path,
+) -> ModeResult:
+    """Measure the continuous Gradio architecture, including bounded output I/O."""
+    pipeline_started_at = time.perf_counter()
+    init_started_at = time.perf_counter()
+    state = predictor.init_state(
+        video_path=str(arguments.video_path),
+        offload_video_to_cpu=True,
+        offload_state_to_cpu=True,
+        frame_loading="lazy",
+        frame_buffer_size=arguments.frame_buffer_size,
+        enable_gpu_frame_staging=arguments.device.type == "cuda",
+    )
+    init_seconds = time.perf_counter() - init_started_at
+    sampler.capture("stream_initialized")
+
+    prompt_started_at = time.perf_counter()
+    add_prompt(predictor, state, prompt)
+    prompt_seconds = time.perf_counter() - prompt_started_at
+    sampler.capture("post_prompt", prompt.frame_idx)
+
+    metadata = state["frame_source"].metadata
+    expected_frame_count = metadata.frame_count
+    if arguments.max_frames is not None:
+        expected_frame_count = min(expected_frame_count, arguments.max_frames)
+    writer = BoundedVideoMaskWriter(
+        input_path=arguments.video_path,
+        output_path=run_directory / "output.mp4",
+        fps=metadata.fps if metadata.fps is not None else 30.0,
+        frame_size=(metadata.video_width, metadata.video_height),
+        expected_frame_count=expected_frame_count,
+        expected_object_ids=(prompt.obj_id,),
+        capacity=4,
+    )
+
+    traces: list[FrameTrace] = []
+    propagation_started_at = time.perf_counter()
+    iterator = predictor.propagate_in_video(state)
+    writer_stats: VideoOutputWriterStats | None = None
+    try:
+        while len(traces) < expected_frame_count:
+            sampler.set_position("propagation", len(traces))
+            try:
+                prediction = measure_prediction(iterator, arguments.device)
+            except StopIteration:
+                break
+
+            output_started_at = time.perf_counter()
+            masks = prediction.binary_masks.numpy()
+            if masks.ndim == 4 and masks.shape[1] == 1:
+                masks = masks[:, 0]
+            writer.submit(prediction.frame_idx, prediction.object_ids, masks)
+            output_frame_seconds = time.perf_counter() - output_started_at
+            trace = FrameTrace(
+                repeat_index=config.repeat_index,
+                global_frame_idx=prediction.frame_idx,
+                source_frame_idx=prediction.frame_idx,
+                chunk_idx=None,
+                object_ids=prediction.object_ids,
+                mask_checksums=prediction.mask_checksums,
+                gpu_inference_ms=prediction.gpu_inference_ms,
+                mask_materialization_ms=prediction.mask_materialization_ms,
+                output_processing_ms=output_frame_seconds * 1000.0,
+                frame_wall_ms=(time.perf_counter() - prediction.started_at) * 1000.0,
+                elapsed_seconds=time.perf_counter() - pipeline_started_at,
+            )
+            traces.append(trace)
+            live_reporter.publish_frame(trace)
+        writer_stats = writer.close()
+    except BaseException:
+        writer.abort()
+        raise
+    finally:
+        iterator.close()
+        predictor.reset_state(state)
+        predictor.close_video_source(state)
+    propagation_seconds = time.perf_counter() - propagation_started_at
+
+    frame_source_stats = (state["frame_source"].stats(),)
+    frame_stager = state.get("frame_stager")
+    frame_stager_stats = (
+        (frame_stager.stats(),) if isinstance(frame_stager, GpuFrameStager) else ()
+    )
+    sampler.capture("run_complete", traces[-1].global_frame_idx if traces else None)
+    return ModeResult(
+        traces=tuple(traces),
+        video_prepare_seconds=0.0,
+        init_state_seconds=init_seconds,
+        prompt_seconds=prompt_seconds,
+        propagation_seconds=propagation_seconds,
+        output_encode_seconds=writer_stats.worker_seconds,
+        measured_pipeline_seconds=time.perf_counter() - pipeline_started_at,
+        frame_source_stats=frame_source_stats,
+        frame_stager_stats=frame_stager_stats,
+        output_writer_stats=(writer_stats,),
+    )
+
+
 def write_run_artifacts(
     *,
     run_directory: Path,
@@ -714,6 +913,9 @@ def write_run_artifacts(
     summary: RunSummary,
     frame_source_stats: Sequence[FrameSourceStats],
     frame_stager_stats: Sequence[GpuFrameStagerStats],
+    feature_pipeline_stats: Sequence[GpuImageFeaturePipelineStats],
+    output_writer_stats: Sequence[VideoOutputWriterStats],
+    gpu_stage_profile: GpuStageProfile | None,
 ) -> None:
     validate_run_artifacts(summary, traces, samples)
     write_json(run_directory / "config.json", config)
@@ -728,6 +930,20 @@ def write_run_artifacts(
         run_directory / "frame_stagers.json",
         tuple(asdict(stats) for stats in frame_stager_stats),
     )
+    write_json(
+        run_directory / "image_feature_pipeline.json",
+        tuple(asdict(stats) for stats in feature_pipeline_stats),
+    )
+    write_json(
+        run_directory / "output_writers.json",
+        tuple(asdict(stats) for stats in output_writer_stats),
+    )
+    if gpu_stage_profile is not None:
+        write_json(run_directory / "gpu_stage_profile.json", gpu_stage_profile)
+        write_json(
+            run_directory / "gpu_stage_trace.json",
+            gpu_stage_profile_to_chrome_trace(gpu_stage_profile),
+        )
     write_json(run_directory / "summary.json", summary)
 
 
@@ -761,6 +977,10 @@ def execute_repeat(
         memory_sample_interval_seconds=arguments.memory_sample_interval_seconds,
         offload_video_to_cpu=arguments.offload_video_to_cpu,
         offload_state_to_cpu=arguments.offload_state_to_cpu,
+        compile_video_pipeline=arguments.compile_video_pipeline,
+        compile_mask_decoder=arguments.compile_mask_decoder,
+        concurrent_image_encoder=arguments.concurrent_image_encoder,
+        profile_gpu_stages=arguments.profile_gpu_stages,
     )
     live_reporter = LiveMetricsReporter(
         run_directory / "live_metrics.jsonl" if arguments.live_metrics else None
@@ -788,8 +1008,18 @@ def execute_repeat(
                     sampler=sampler,
                     live_reporter=live_reporter,
                 )
-            else:
+            elif arguments.mode == "demo-chunked":
                 mode_result = run_demo_chunked(
+                    predictor=predictor,
+                    arguments=arguments,
+                    config=config,
+                    prompt=prompt,
+                    sampler=sampler,
+                    live_reporter=live_reporter,
+                    run_directory=run_directory,
+                )
+            else:
+                mode_result = run_demo_streaming(
                     predictor=predictor,
                     arguments=arguments,
                     config=config,
@@ -858,6 +1088,15 @@ def execute_repeat(
         ),
         frame_stager_stats=(
             mode_result.frame_stager_stats if mode_result is not None else ()
+        ),
+        feature_pipeline_stats=(
+            mode_result.feature_pipeline_stats if mode_result is not None else ()
+        ),
+        output_writer_stats=(
+            mode_result.output_writer_stats if mode_result is not None else ()
+        ),
+        gpu_stage_profile=(
+            mode_result.gpu_stage_profile if mode_result is not None else None
         ),
     )
     if status == "failed":

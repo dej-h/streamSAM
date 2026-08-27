@@ -85,6 +85,10 @@ class BenchmarkConfig:
     memory_sample_interval_seconds: float
     offload_video_to_cpu: bool
     offload_state_to_cpu: bool
+    compile_video_pipeline: bool = False
+    compile_mask_decoder: bool = False
+    concurrent_image_encoder: bool = False
+    profile_gpu_stages: bool = False
 
 
 @dataclass(frozen=True)

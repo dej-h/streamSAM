@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import torch
 
-from sam2.utils.misc import load_video_frames
+from sam2.utils.misc import _load_img_as_tensor, load_video_frames
 
 
 VideoInput = str | bytes
@@ -339,6 +339,199 @@ class SequentialMp4FrameSource:
             raise RuntimeError("frame source is closed")
 
 
+class SequentialImageDirectoryFrameSource:
+    """Prefetch normalized numbered image frames through a bounded CPU queue."""
+
+    _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".JPG", ".JPEG"})
+
+    def __init__(
+        self,
+        video_path: str,
+        image_size: int,
+        capacity: int,
+        img_mean: RgbMean,
+        img_std: RgbStd,
+    ) -> None:
+        if image_size <= 0:
+            raise ValueError("image size must be positive")
+        if capacity <= 0:
+            raise ValueError("frame source capacity must be positive")
+
+        image_directory = Path(video_path).expanduser().resolve()
+        if not image_directory.is_dir():
+            raise NotADirectoryError(image_directory)
+        frame_paths = sorted(
+            (
+                path
+                for path in image_directory.iterdir()
+                if path.suffix in self._IMAGE_SUFFIXES
+            ),
+            key=lambda path: int(path.stem),
+        )
+        if not frame_paths:
+            raise RuntimeError(f"no numbered JPEG images found in {image_directory}")
+
+        _, video_height, video_width = _load_img_as_tensor(
+            str(frame_paths[0]), image_size
+        )
+        self._metadata = FrameSourceMetadata(
+            frame_count=len(frame_paths),
+            video_height=video_height,
+            video_width=video_width,
+            fps=None,
+            image_size=image_size,
+            preprocessing_identity=_preprocessing_identity(
+                image_size, img_mean, img_std
+            ),
+        )
+        self._frame_paths = tuple(frame_paths)
+        self._capacity = capacity
+        self._mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        self._std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        self._condition = Condition()
+        self._frames: OrderedDict[int, torch.Tensor] = OrderedDict()
+        self._next_decode_index = 0
+        self._inflight_index: int | None = None
+        self._generation = 0
+        self._worker_error: BaseException | None = None
+        self._closed = False
+        self._decoded_frames = 0
+        self._seek_count = 0
+        self._wait_count = 0
+        self._wait_seconds = 0.0
+        self._maximum_depth = 0
+        self._worker = Thread(
+            target=self._decode_loop,
+            name="sam2-image-directory-decoder",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def metadata(self) -> FrameSourceMetadata:
+        return self._metadata
+
+    def __len__(self) -> int:
+        return len(self._frame_paths)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        if index < 0 or index >= len(self):
+            raise IndexError(f"frame index {index} is outside the image sequence")
+
+        wait_started_at = time.perf_counter()
+        waited = False
+        with self._condition:
+            self._raise_worker_error_locked()
+            if self._closed:
+                raise RuntimeError("frame source is closed")
+            if (
+                index not in self._frames
+                and index != self._inflight_index
+                and index != self._next_decode_index
+            ):
+                self._generation += 1
+                self._frames.clear()
+                self._next_decode_index = index
+                self._seek_count += 1
+                self._condition.notify_all()
+
+            while index not in self._frames:
+                self._raise_worker_error_locked()
+                if self._closed:
+                    raise RuntimeError("frame source closed before frame was decoded")
+                waited = True
+                self._condition.wait()
+
+            frame = self._frames.pop(index)
+            if waited:
+                self._wait_count += 1
+                self._wait_seconds += time.perf_counter() - wait_started_at
+            self._condition.notify_all()
+            return frame
+
+    def stats(self) -> FrameSourceStats:
+        with self._condition:
+            return FrameSourceStats(
+                capacity=self._capacity,
+                current_depth=len(self._frames),
+                maximum_depth=self._maximum_depth,
+                decoded_frames=self._decoded_frames,
+                seek_count=self._seek_count,
+                wait_count=self._wait_count,
+                wait_seconds=self._wait_seconds,
+                closed=self._closed,
+            )
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._frames.clear()
+            self._condition.notify_all()
+        self._worker.join()
+
+    def _decode_loop(self) -> None:
+        try:
+            while True:
+                with self._condition:
+                    while (
+                        not self._closed
+                        and (
+                            len(self._frames) >= self._capacity
+                            or self._next_decode_index >= len(self)
+                        )
+                    ):
+                        self._condition.wait()
+                    if self._closed:
+                        return
+                    frame_idx = self._next_decode_index
+                    self._inflight_index = frame_idx
+                    generation = self._generation
+                    self._next_decode_index += 1
+
+                frame, height, width = _load_img_as_tensor(
+                    str(self._frame_paths[frame_idx]), self._metadata.image_size
+                )
+                if (
+                    height != self._metadata.video_height
+                    or width != self._metadata.video_width
+                ):
+                    raise ValueError(
+                        f"frame {frame_idx} has dimensions {width}x{height}; expected "
+                        f"{self._metadata.video_width}x{self._metadata.video_height}"
+                    )
+                # The eager JPEG loader copies PIL's float64 tensor into a float32
+                # batch before normalization. Match that ordering exactly so lazy
+                # directory input is mask-equivalent to the existing core path.
+                frame = frame.to(dtype=torch.float32)
+                frame.sub_(self._mean).div_(self._std)
+
+                with self._condition:
+                    if self._closed:
+                        return
+                    if generation != self._generation:
+                        if self._inflight_index == frame_idx:
+                            self._inflight_index = None
+                        self._condition.notify_all()
+                        continue
+                    self._frames[frame_idx] = frame
+                    self._inflight_index = None
+                    self._decoded_frames += 1
+                    self._maximum_depth = max(
+                        self._maximum_depth, len(self._frames)
+                    )
+                    self._condition.notify_all()
+        except BaseException as error:
+            with self._condition:
+                self._worker_error = error
+                self._condition.notify_all()
+
+    def _raise_worker_error_locked(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError("image-directory decoder failed") from self._worker_error
+
+
 def create_video_frame_source(
     *,
     video_path: VideoInput,
@@ -355,18 +548,28 @@ def create_video_frame_source(
         -1
     ] in (".mp4", ".MP4")
     if loading_mode == "lazy":
-        if not is_mp4_input:
-            raise ValueError("lazy frame loading currently supports MP4 input only")
-        return SequentialMp4FrameSource(
-            video_path=video_path,
-            image_size=image_size,
-            capacity=buffer_capacity,
-            img_mean=img_mean,
-            img_std=img_std,
-            # Pinning every decoded tensor makes PyTorch's pinned allocator retain
-            # host memory over long videos. A bounded GPU stager must own and reuse
-            # pinned buffers instead of making them part of the decoder queue.
-            pin_memory=False,
+        if is_mp4_input:
+            return SequentialMp4FrameSource(
+                video_path=video_path,
+                image_size=image_size,
+                capacity=buffer_capacity,
+                img_mean=img_mean,
+                img_std=img_std,
+                # Pinning every decoded tensor makes PyTorch's pinned allocator retain
+                # host memory over long videos. A bounded GPU stager must own and reuse
+                # pinned buffers instead of making them part of the decoder queue.
+                pin_memory=False,
+            )
+        if isinstance(video_path, str) and os.path.isdir(video_path):
+            return SequentialImageDirectoryFrameSource(
+                video_path=video_path,
+                image_size=image_size,
+                capacity=buffer_capacity,
+                img_mean=img_mean,
+                img_std=img_std,
+            )
+        raise ValueError(
+            "lazy frame loading supports MP4 input or a numbered JPEG directory"
         )
 
     if is_mp4_input:

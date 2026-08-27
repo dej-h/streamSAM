@@ -29,6 +29,18 @@ OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
 ALLOW_ALL_KERNELS = False
 
 
+def configure_compiled_sdpa_backends() -> None:
+    """Apply the eager EdgeTAM SDPA policy globally before graph capture."""
+    if ALLOW_ALL_KERNELS:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        return
+    torch.backends.cuda.enable_flash_sdp(USE_FLASH_ATTN)
+    torch.backends.cuda.enable_math_sdp(MATH_KERNEL_ON)
+    torch.backends.cuda.enable_mem_efficient_sdp(OLD_GPU)
+
+
 def sdp_kernel_context(dropout_p):
     """
     Get the context for the attention scaled dot-product kernel. We use Flash Attention
@@ -269,20 +281,28 @@ class Attention(nn.Module):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        try:
-            with sdp_kernel_context(dropout_p):
-                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        except Exception as e:
-            # Fall back to all kernels if the Flash attention kernel fails
-            warnings.warn(
-                f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
-                f"kernels for scaled_dot_product_attention (which may have a slower speed).",
-                category=UserWarning,
-                stacklevel=2,
-            )
-            global ALLOW_ALL_KERNELS
-            ALLOW_ALL_KERNELS = True
+        if torch.compiler.is_compiling():
+            # Dynamo cannot place the Python SDPA context manager in a full graph.
+            # Backend selection is already represented by the captured SDPA operator.
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        else:
+            try:
+                with sdp_kernel_context(dropout_p):
+                    out = F.scaled_dot_product_attention(
+                        q, k, v, dropout_p=dropout_p
+                    )
+            except Exception as e:
+                # Fall back to all kernels if the Flash attention kernel fails
+                warnings.warn(
+                    f"Flash Attention kernel failed due to: {e}\nFalling back to all "
+                    "available kernels for scaled_dot_product_attention (which may "
+                    "have a slower speed).",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                global ALLOW_ALL_KERNELS
+                ALLOW_ALL_KERNELS = True
+                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
@@ -343,20 +363,26 @@ class RoPEAttention(Attention):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        try:
-            with sdp_kernel_context(dropout_p):
-                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        except Exception as e:
-            # Fall back to all kernels if the Flash attention kernel fails
-            warnings.warn(
-                f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
-                f"kernels for scaled_dot_product_attention (which may have a slower speed).",
-                category=UserWarning,
-                stacklevel=2,
-            )
-            global ALLOW_ALL_KERNELS
-            ALLOW_ALL_KERNELS = True
+        if torch.compiler.is_compiling():
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        else:
+            try:
+                with sdp_kernel_context(dropout_p):
+                    out = F.scaled_dot_product_attention(
+                        q, k, v, dropout_p=dropout_p
+                    )
+            except Exception as e:
+                # Fall back to all kernels if the Flash attention kernel fails
+                warnings.warn(
+                    f"Flash Attention kernel failed due to: {e}\nFalling back to all "
+                    "available kernels for scaled_dot_product_attention (which may "
+                    "have a slower speed).",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                global ALLOW_ALL_KERNELS
+                ALLOW_ALL_KERNELS = True
+                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
@@ -414,20 +440,26 @@ class RoPEAttentionv2(Attention):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        try:
-            with sdp_kernel_context(dropout_p):
-                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        except Exception as e:
-            # Fall back to all kernels if the Flash attention kernel fails
-            warnings.warn(
-                f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
-                f"kernels for scaled_dot_product_attention (which may have a slower speed).",
-                category=UserWarning,
-                stacklevel=2,
-            )
-            global ALLOW_ALL_KERNELS
-            ALLOW_ALL_KERNELS = True
+        if torch.compiler.is_compiling():
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        else:
+            try:
+                with sdp_kernel_context(dropout_p):
+                    out = F.scaled_dot_product_attention(
+                        q, k, v, dropout_p=dropout_p
+                    )
+            except Exception as e:
+                # Fall back to all kernels if the Flash attention kernel fails
+                warnings.warn(
+                    f"Flash Attention kernel failed due to: {e}\nFalling back to all "
+                    "available kernels for scaled_dot_product_attention (which may "
+                    "have a slower speed).",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                global ALLOW_ALL_KERNELS
+                ALLOW_ALL_KERNELS = True
+                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
