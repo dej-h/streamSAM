@@ -610,10 +610,12 @@ class SAM2VideoPredictor(SAM2Base):
                     align_corners=False,
                 )
                 consolidated_pred_masks[obj_idx : obj_idx + 1] = resized_obj_mask
-            consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = out["obj_ptr"]
+            consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = out["obj_ptr"].to(
+                inference_state["device"], non_blocking=True
+            )
             consolidated_out["object_score_logits"][obj_idx : obj_idx + 1] = out[
                 "object_score_logits"
-            ]
+            ].to(inference_state["device"], non_blocking=True)
 
         # Optionally, apply non-overlapping constraints on the consolidated scores
         # and rerun the memory encoder
@@ -1138,9 +1140,13 @@ class SAM2VideoPredictor(SAM2Base):
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
         # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
         maskmem_pos_enc = self._get_maskmem_pos_enc(inference_state, current_out)
-        # object pointer is a small tensor, so we always keep it on GPU memory for fast access
-        obj_ptr = current_out["obj_ptr"]
-        object_score_logits = current_out["object_score_logits"]
+        # Object pointers are small individually but one is retained per frame. Store
+        # them with the rest of the inference state so long videos do not grow VRAM;
+        # memory attention moves only its bounded selected pointer window to CUDA.
+        obj_ptr = current_out["obj_ptr"].to(storage_device, non_blocking=True)
+        object_score_logits = current_out["object_score_logits"].to(
+            storage_device, non_blocking=True
+        )
         # make a compact version of this frame's output to reduce the state size
         compact_current_out = {
             "maskmem_features": maskmem_features,
