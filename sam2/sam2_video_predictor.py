@@ -7,7 +7,8 @@
 import contextlib
 import warnings
 from collections import OrderedDict
-from typing import Final
+from dataclasses import dataclass, field
+from typing import Final, Generator, Iterator, Literal
 
 import torch
 
@@ -36,6 +37,47 @@ from tqdm import tqdm
 # frame and a second graph once object-pointer memory is present. Launching the image
 # encoder from another Python thread during those cold compiles can deadlock Inductor.
 FULL_PIPELINE_CONCURRENCY_WARMUP_FRAMES: Final = 2
+
+FrameOutputValue = torch.Tensor | list[torch.Tensor] | None
+FrameOutput = dict[str, FrameOutputValue]
+FrameStorageKey = Literal["cond_frame_outputs", "non_cond_frame_outputs"]
+
+
+@dataclass(frozen=True)
+class VideoFramePrediction:
+    """A frame prediction that has not yet been committed to SAM2 memory.
+
+    ``mask_logits`` are resized to the original video dimensions. Call
+    :meth:`SAM2VideoPredictor.commit_video_frame` before requesting the next
+    prediction. Passing replacement logits to that method changes both the
+    emitted mask and the memory consumed by subsequent frames.
+    """
+
+    frame_idx: int
+    object_ids: tuple[int, ...]
+    mask_logits: torch.Tensor
+    _commit_token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class CommittedVideoFrame:
+    """A frame whose selected mask has been encoded into SAM2 memory."""
+
+    frame_idx: int
+    object_ids: tuple[int, ...]
+    mask_logits: torch.Tensor
+
+
+@dataclass
+class _PendingVideoFrameCommit:
+    token: object
+    frame_idx: int
+    object_ids: tuple[int, ...]
+    storage_key: FrameStorageKey
+    current_out: FrameOutput
+    pred_masks_high_res: torch.Tensor | None
+    memory_already_encoded: bool
+    reverse: bool
 
 
 class SAM2VideoPredictor(SAM2Base):
@@ -118,6 +160,7 @@ class SAM2VideoPredictor(SAM2Base):
             else None
         )
         inference_state["active_frame_lease"] = None
+        inference_state["pending_frame_commit"] = None
         inference_state["gpu_stage_profiler"] = gpu_stage_profiler
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
@@ -755,8 +798,42 @@ class SAM2VideoPredictor(SAM2Base):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
-    ):
-        """Propagate the input points across frames to track in the entire video."""
+    ) -> Generator[tuple[int, list[int], torch.Tensor], None, None]:
+        """Propagate and immediately commit each predicted mask unchanged."""
+        predictions = self.propagate_in_video_predictions(
+            inference_state=inference_state,
+            start_frame_idx=start_frame_idx,
+            max_frame_num_to_track=max_frame_num_to_track,
+            reverse=reverse,
+        )
+        try:
+            for prediction in predictions:
+                committed = self.commit_video_frame(inference_state, prediction)
+                yield (
+                    committed.frame_idx,
+                    list(committed.object_ids),
+                    committed.mask_logits,
+                )
+        finally:
+            predictions.close()
+
+    @torch.inference_mode()
+    def propagate_in_video_predictions(
+        self,
+        inference_state,
+        start_frame_idx: int | None = None,
+        max_frame_num_to_track: int | None = None,
+        reverse: bool = False,
+    ) -> Generator[VideoFramePrediction, None, None]:
+        """Yield each mask before it is committed to temporal memory.
+
+        Exactly one prediction may be pending. The caller must pass it to
+        :meth:`commit_video_frame` before advancing this iterator. This keeps
+        the recurrent SAM2 state ordered while allowing a downstream system to
+        inspect or replace a frame mask before the memory encoder consumes it.
+        """
+        if inference_state.get("pending_frame_commit") is not None:
+            raise RuntimeError("a video frame is already awaiting commit")
         self.propagate_in_video_preflight(inference_state)
 
         output_dict = inference_state["output_dict"]
@@ -777,6 +854,7 @@ class SAM2VideoPredictor(SAM2Base):
         if max_frame_num_to_track is None:
             # default: track all the frames in the video
             max_frame_num_to_track = num_frames
+        assert max_frame_num_to_track is not None
         if reverse:
             end_frame_idx = max(start_frame_idx - max_frame_num_to_track, 0)
             if start_frame_idx > 0:
@@ -795,9 +873,11 @@ class SAM2VideoPredictor(SAM2Base):
             # batched forward on them via `_run_single_frame_inference` because the
             # number of clicks on each object might be different.
             if frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
-                storage_key = "cond_frame_outputs"
+                storage_key: FrameStorageKey = "cond_frame_outputs"
                 current_out = output_dict[storage_key][frame_idx]
                 pred_masks = current_out["pred_masks"]
+                pred_masks_high_res = None
+                memory_already_encoded = True
                 if clear_non_cond_mem:
                     # clear non-conditioning memory of the surrounding frames
                     self._clear_non_cond_mem_around_input(inference_state, frame_idx)
@@ -805,6 +885,8 @@ class SAM2VideoPredictor(SAM2Base):
                 storage_key = "non_cond_frame_outputs"
                 current_out = output_dict[storage_key][frame_idx]
                 pred_masks = current_out["pred_masks"]
+                pred_masks_high_res = None
+                memory_already_encoded = True
             else:
                 storage_key = "non_cond_frame_outputs"
                 current_out, pred_masks = self._run_single_frame_inference(
@@ -816,23 +898,163 @@ class SAM2VideoPredictor(SAM2Base):
                     point_inputs=None,
                     mask_inputs=None,
                     reverse=reverse,
-                    run_mem_encoder=True,
+                    run_mem_encoder=False,
                     prefetch_frame_idx=(frame_idx - 1 if reverse else frame_idx + 1),
+                    retain_high_res_masks=True,
                 )
-                output_dict[storage_key][frame_idx] = current_out
-            # Create slices of per-object outputs for subsequent interaction with each
-            # individual object after tracking.
-            self._add_output_per_object(
-                inference_state, frame_idx, current_out, storage_key
-            )
-            inference_state["frames_already_tracked"][frame_idx] = {"reverse": reverse}
+                retained_high_res_masks = current_out.pop("pred_masks_high_res")
+                if not isinstance(retained_high_res_masks, torch.Tensor):
+                    raise TypeError("pending frame is missing high-resolution logits")
+                pred_masks_high_res = retained_high_res_masks
+                memory_already_encoded = False
 
             # Resize the output mask to the original video resolution (we directly use
             # the mask scores on GPU for output to avoid any CPU conversion in between)
             _, video_res_masks = self._get_orig_video_res_output(
                 inference_state, pred_masks
             )
-            yield frame_idx, obj_ids, video_res_masks
+            token = object()
+            object_ids = tuple(int(obj_id) for obj_id in obj_ids)
+            pending = _PendingVideoFrameCommit(
+                token=token,
+                frame_idx=frame_idx,
+                object_ids=object_ids,
+                storage_key=storage_key,
+                current_out=current_out,
+                pred_masks_high_res=pred_masks_high_res,
+                memory_already_encoded=memory_already_encoded,
+                reverse=reverse,
+            )
+            inference_state["pending_frame_commit"] = pending
+            prediction = VideoFramePrediction(
+                frame_idx=frame_idx,
+                object_ids=object_ids,
+                mask_logits=video_res_masks,
+                _commit_token=token,
+            )
+            try:
+                yield prediction
+            except GeneratorExit:
+                if inference_state.get("pending_frame_commit") is pending:
+                    inference_state["pending_frame_commit"] = None
+                raise
+            if inference_state.get("pending_frame_commit") is pending:
+                inference_state["pending_frame_commit"] = None
+                raise RuntimeError(
+                    f"frame {frame_idx} was not committed before requesting the next frame"
+                )
+
+    @torch.inference_mode()
+    def commit_video_frame(
+        self,
+        inference_state,
+        prediction: VideoFramePrediction,
+        *,
+        adjusted_mask_logits: torch.Tensor | None = None,
+    ) -> CommittedVideoFrame:
+        """Commit a predicted or replacement mask to the recurrent video state.
+
+        Replacement logits must have the same ``[objects, 1, H, W]`` shape as
+        ``prediction.mask_logits``. Boolean masks are accepted and converted to
+        high-confidence foreground/background logits before memory encoding.
+        """
+        pending = inference_state.get("pending_frame_commit")
+        if not isinstance(pending, _PendingVideoFrameCommit):
+            raise RuntimeError("no video frame is awaiting commit")
+        if pending.token is not prediction._commit_token:
+            raise ValueError("prediction does not match the pending video frame")
+        if pending.frame_idx != prediction.frame_idx:
+            raise ValueError("prediction frame index does not match the pending frame")
+
+        current_out = pending.current_out
+        device = inference_state["device"]
+        output_mask_logits = prediction.mask_logits
+        high_res_masks = pending.pred_masks_high_res
+        mask_was_adjusted = adjusted_mask_logits is not None
+        if adjusted_mask_logits is not None:
+            if adjusted_mask_logits.shape != prediction.mask_logits.shape:
+                raise ValueError(
+                    "adjusted mask logits must match prediction shape "
+                    f"{tuple(prediction.mask_logits.shape)}, received "
+                    f"{tuple(adjusted_mask_logits.shape)}"
+                )
+            if adjusted_mask_logits.dtype == torch.bool:
+                adjusted_mask_logits = torch.where(
+                    adjusted_mask_logits,
+                    torch.tensor(32.0, device=adjusted_mask_logits.device),
+                    torch.tensor(-32.0, device=adjusted_mask_logits.device),
+                )
+            elif not adjusted_mask_logits.is_floating_point():
+                raise TypeError("adjusted mask logits must be floating point or boolean")
+            adjusted_mask_logits = adjusted_mask_logits.detach().to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+            stored_mask_logits = current_out["pred_masks"]
+            if not isinstance(stored_mask_logits, torch.Tensor):
+                raise RuntimeError("The pending frame output has no tensor mask logits")
+            low_res_masks = torch.nn.functional.interpolate(
+                adjusted_mask_logits,
+                size=stored_mask_logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            high_res_masks = torch.nn.functional.interpolate(
+                adjusted_mask_logits,
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            current_out["pred_masks"] = low_res_masks.to(
+                inference_state["storage_device"], non_blocking=True
+            )
+            output_mask_logits = adjusted_mask_logits
+
+        if not pending.memory_already_encoded or mask_was_adjusted:
+            if high_res_masks is None:
+                raise RuntimeError("pending frame has no mask available for memory encoding")
+            object_score_logits = current_out["object_score_logits"]
+            if not isinstance(object_score_logits, torch.Tensor):
+                raise TypeError("pending frame has invalid object-score logits")
+            profiler = inference_state.get("gpu_stage_profiler")
+            profile_context = (
+                profiler.frame(pending.frame_idx, "memory")
+                if isinstance(profiler, GpuStageProfiler)
+                else contextlib.nullcontext()
+            )
+            with profile_context:
+                maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
+                    inference_state=inference_state,
+                    frame_idx=pending.frame_idx,
+                    batch_size=len(pending.object_ids),
+                    high_res_masks=high_res_masks,
+                    object_score_logits=object_score_logits.to(
+                        device, non_blocking=True
+                    ),
+                    is_mask_from_pts=(
+                        mask_was_adjusted
+                        or pending.storage_key == "cond_frame_outputs"
+                    ),
+                )
+            current_out["maskmem_features"] = maskmem_features
+            current_out["maskmem_pos_enc"] = maskmem_pos_enc
+
+        output_dict = inference_state["output_dict"]
+        output_dict[pending.storage_key][pending.frame_idx] = current_out
+        self._add_output_per_object(
+            inference_state,
+            pending.frame_idx,
+            current_out,
+            pending.storage_key,
+        )
+        inference_state["frames_already_tracked"][pending.frame_idx] = {
+            "reverse": pending.reverse
+        }
+        inference_state["pending_frame_commit"] = None
+        return CommittedVideoFrame(
+            frame_idx=pending.frame_idx,
+            object_ids=pending.object_ids,
+            mask_logits=output_mask_logits,
+        )
 
     def _add_output_per_object(
         self, inference_state, frame_idx, current_out, storage_key
@@ -1077,6 +1299,7 @@ class SAM2VideoPredictor(SAM2Base):
         run_mem_encoder,
         prev_sam_mask_logits=None,
         prefetch_frame_idx: int | None = None,
+        retain_high_res_masks: bool = False,
     ):
         """Run tracking on a single frame based on current inputs and previous memory."""
         profiler = inference_state.get("gpu_stage_profiler")
@@ -1155,6 +1378,14 @@ class SAM2VideoPredictor(SAM2Base):
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
         }
+        if retain_high_res_masks:
+            if run_mem_encoder:
+                raise ValueError(
+                    "high-resolution logits are retained only for deferred memory commit"
+                )
+            compact_current_out["pred_masks_high_res"] = current_out[
+                "pred_masks_high_res"
+            ]
         return compact_current_out, pred_masks_gpu
 
     def _run_memory_encoder(
