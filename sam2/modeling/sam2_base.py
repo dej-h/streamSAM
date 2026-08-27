@@ -689,8 +689,9 @@ class SAM2Base(torch.nn.Module):
                 if len(pos_and_ptrs) > 0:
                     pos_list, ptrs_list = zip(*pos_and_ptrs)
                     # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
-                    obj_ptrs = torch.stack(ptrs_list, dim=0).to(
-                        device, non_blocking=True
+                    obj_ptrs = torch.stack(
+                        [ptr.to(device, non_blocking=True) for ptr in ptrs_list],
+                        dim=0,
                     )
                     # a temporal positional embedding based on how far each object pointer is from
                     # the current frame (sine embedding normalized by the max pointer num).
