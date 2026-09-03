@@ -372,6 +372,19 @@ def torch_dtype(name: DTypeName) -> torch.dtype:
     }[name]
 
 
+def video_frame_count(path: Path) -> int:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError(f"could not open video for metadata: {path}")
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        capture.release()
+    if frame_count <= 0:
+        raise RuntimeError(f"video reports no frames: {path}")
+    return frame_count
+
+
 def inference_context(
     device: torch.device, dtype: torch.dtype
 ) -> contextlib.AbstractContextManager[object]:
@@ -1122,8 +1135,16 @@ def main() -> None:
     shared_metadata.update(
         {
             "repository_revision": repository_revision(REPOSITORY_ROOT),
+            "video_sha256": sha256_file(arguments.video_path),
             "checkpoint_sha256": sha256_file(arguments.checkpoint_path),
             "prompt_sha256": sha256_file(arguments.prompt_path),
+            "model_image_size": predictor.image_size,
+            "source_frame_count": video_frame_count(arguments.video_path),
+            "gpu_total_memory_bytes": (
+                torch.cuda.get_device_properties(arguments.device).total_memory
+                if arguments.device.type == "cuda"
+                else None
+            ),
         }
     )
 

@@ -2,6 +2,33 @@
 
 Bounded, observable streaming video segmentation built on SAM 2 and EdgeTAM.
 
+[![streamSAM 1,000-frame benchmark: segmentation beside synchronized FPS, VRAM and RSS telemetry](docs/assets/streamsam-benchmark-poster.jpg)](docs/assets/streamsam-benchmark.mp4)
+
+<p align="center">
+  <strong><a href="docs/assets/streamsam-benchmark.mp4">Watch the 32-second benchmark replay</a></strong><br>
+  One point prompt, 1,000 frames, synchronized segmentation and recorded telemetry.
+</p>
+
+| Execution strategy | Result | End-to-end FPS | Peak process RSS |
+| --- | ---: | ---: | ---: |
+| Original eager loading | Safety stop before frame 1 | n/a | 4.5 GiB limit |
+| Independent 96-frame batches | 1,000 / 1,000 frames | 17.46 | 4.40 GiB |
+| streamSAM | 1,000 / 1,000 frames | **24.49** | **2.52 GiB** |
+
+This is one matched local run on an NVIDIA GeForce RTX 5060 Laptop GPU using
+BF16 without compilation. The source, checkpoint, prompt and shared settings are
+the same across all three strategies. streamSAM was 40.2% faster than independent
+chunking and used 42.6% less peak process RSS in this run.
+
+The source contains 1,025 frames and the requested workload is 1,000. The
+original eager initializer tries to materialize the complete 12.01 GiB
+normalized input tensor before the frame limit can apply, exceeding the 7.96
+GiB GPU capacity. The runner stopped it at the configured host RSS limit rather
+than destabilizing the machine. This is a recorded safety stop, not a claimed
+CUDA OOM. The two successful 1,000-frame runs reuse their original telemetry;
+the chart renderer runs afterward and does not affect the measurements. No
+benchmark process runs through Gradio.
+
 `streamSAM` is a systems fork of EdgeTAM for long-running, frame-ordered video
 workloads. It keeps the existing `sam2` Python API, EdgeTAM checkpoints and model
 configs, then adds the execution layer needed to stream without retaining a
@@ -125,10 +152,49 @@ pip install -e ".[gradio]"
 Run the demo:
 
 ```bash
-python gradio_app.py
+python3 gradio_app.py
 ```
 
 The demo will be available at http://127.0.0.1:7860/ by default. You can change the port by setting the `--port` argument.
+
+### Reproduce the benchmark
+
+The benchmark runner executes three strategies sequentially with the same video,
+prompt, model and dtype:
+
+- Original eager loading, which materializes every normalized frame before inference.
+- Chunked batches, which cap memory by processing independent 96-frame chunks.
+- Streaming, which keeps a bounded frame queue and uninterrupted temporal state.
+
+The original eager process has a configurable RSS safety limit. If it reaches the
+limit, the runner interrupts it and records a safety stop instead of letting the host
+run out of memory. This is reported separately from a real CUDA OOM. The eager path
+materializes the full source before the inference loop can apply `--max-frames`. Use
+an input with exactly the requested frame count for a matched run. The eager path does
+not render output, so its FPS is not compared with the complete chunked and streaming
+pipelines.
+
+All three runs write raw frame and memory telemetry before a separate process renders
+the masked video and synchronized charts.
+
+```bash
+uv run --group benchmark python3 -m benchmarks.run_benchmark_demo \
+  --video examples/01_dog.mp4 \
+  --prompt examples/prompts/01_dog.json \
+  --max-frames 200 \
+  --playback-speed 2
+```
+
+Each run writes `frames.jsonl`, `memory.jsonl`, `summary.json` and `output.mp4`.
+Failed or safety-stopped strategies may not produce `output.mp4`. The comparison
+directory adds `comparison.json`, exact subprocess logs and
+`streamsam_benchmark_replay.mp4`. Use `--playback-speed` to shorten the replay without
+changing the benchmark timestamps or reported measurements. Pass a longer video with
+`--max-frames 1000` for the full 1,000-frame version.
+
+Pass both `--reuse-chunked-run` and `--reuse-streaming-run` with existing `run_000`
+directories to execute only the original eager strategy and render it against saved
+results. The renderer rejects mismatched video, checkpoint and prompt hashes.
 
 ### Image prediction
 
