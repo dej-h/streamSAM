@@ -1,4 +1,4 @@
-# SAM2 streaming scratchpad
+# streamSAM engineering scratchpad
 
 ## Intent
 

@@ -507,7 +507,7 @@ def write_markdown_report(
     deltas: Sequence[CompilationDelta],
 ) -> None:
     lines = [
-        "# EdgeTAM video benchmark matrix",
+        "# streamSAM video benchmark matrix",
         "",
         "Five normalized 200-frame, 960x540 videos per condition. Compilation is ",
         "the repository's image-encoder `torch.compile` path, not full-predictor compilation.",

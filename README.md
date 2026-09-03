@@ -1,4 +1,45 @@
-# EdgeTAM: On-Device Track Anything Model
+# streamSAM
+
+Bounded, observable streaming video segmentation built on SAM 2 and EdgeTAM.
+
+`streamSAM` is a systems fork of EdgeTAM for long-running, frame-ordered video
+workloads. It keeps the existing `sam2` Python API, EdgeTAM checkpoints and model
+configs, then adds the execution layer needed to stream without retaining a
+video-sized working set.
+
+## What streamSAM adds
+
+- Lazy frame sources with bounded decode queues and explicit backpressure.
+- A fixed two-slot pinned-memory and GPU staging ring with CUDA event ownership.
+- Optional one-frame-ahead image feature production on a separate CUDA stream.
+- A predict-then-commit API that lets downstream systems adjust a mask before it
+  enters temporal memory.
+- Bounded asynchronous video output, GPU stage timing, NVTX ranges and Perfetto
+  traces.
+- Contract checks and matched benchmark tooling for throughput, memory and mask
+  fidelity.
+
+The temporal model still advances in order. Decode, transfer, optional image
+encoding and output work can overlap around it, while queues, frame slots,
+features and memory state stay bounded.
+
+The import namespace remains `sam2`. Existing calls such as
+`from sam2.build_sam import build_sam2_video_predictor` keep working. The
+`edgetam.yaml` config and `edgetam.pt` checkpoint names also remain unchanged
+because they identify the upstream model, not this repository's streaming layer.
+
+## Lineage and thanks
+
+streamSAM exists because Meta published [SAM 2](https://github.com/facebookresearch/sam2)
+and [EdgeTAM](https://github.com/facebookresearch/EdgeTAM). Thank you to both
+teams for the predictor API, model architecture, checkpoints and research this
+work extends. streamSAM is an independent fork and is not affiliated with or
+endorsed by Meta.
+
+The EdgeTAM paper, authors and original results are retained below. Cite the
+upstream work when you use its model or checkpoints.
+
+## EdgeTAM upstream
 
 [Chong Zhou<sup>1,2*</sup>](https://chongzhou96.github.io/),
 [Chenchen Zhu<sup>1</sup>](https://sites.google.com/andrew.cmu.edu/zcckernel/home),
@@ -22,7 +63,7 @@
 [[`Paper`](https://arxiv.org/abs/2501.07256)] [[`Demo`](https://huggingface.co/spaces/facebook/EdgeTAM)] [[`BibTeX`](#citing-edgetam)]
 
 
-## Overview
+### Overview
 
 **EdgeTAM** is an on-device executable variant of the SAM 2 for promptable segmentation and tracking in videos.
 It runs **22× faster** than SAM 2 and achieves **16 FPS** on iPhone 15 Pro Max without quantization.
@@ -35,21 +76,23 @@ It runs **22× faster** than SAM 2 and achieves **16 FPS** on iPhone 15 Pro Max 
 
 ## Installation
 
-EdgeTAM needs to be installed first before use. The code requires `python>=3.10`, as well as `torch>=2.3.1` and `torchvision>=0.18.1`. Please follow the instructions [here](https://pytorch.org/get-started/locally/) to install both PyTorch and TorchVision dependencies. You can install EdgeTAM on a GPU machine using:
+streamSAM requires `python>=3.10`, `torch>=2.3.1` and
+`torchvision>=0.18.1`. Install PyTorch and TorchVision for your platform first,
+then install this repository on a GPU machine:
 
 ```bash
-git clone https://github.com/facebookresearch/EdgeTAM.git && cd EdgeTAM
+git clone https://github.com/dej-h/streamSAM.git && cd streamSAM
 
 pip install -e .
 ```
 
-To use the EdgeTAM predictor and run the example notebooks, `jupyter` and `matplotlib` are required and can be installed by:
+To run the predictor notebooks, install the notebook dependencies:
 
 ```bash
 pip install -e ".[notebooks]"
 ```
 
-For CoreML export to deploy EdgeTAM on iOS/macOS devices, install the CoreML dependencies:
+For the upstream EdgeTAM CoreML export path, install the CoreML dependencies:
 
 ```bash
 pip install -e ".[coreml]"
@@ -67,8 +110,11 @@ Note:
 
 Model is available [here](https://github.com/facebookresearch/EdgeTAM/tree/main/checkpoints/edgetam.pt).
 
-### On-device Gradio demo for EdgeTAM
-Follow the instructions below to run the on-device demo for EdgeTAM. If you want to quickly try out the demo, you can also go to [Hugging Face Spaces](https://huggingface.co/spaces/facebook/EdgeTAM).
+### streamSAM Gradio demo
+
+The local demo exercises streamSAM's bounded video path with the EdgeTAM model.
+The [upstream EdgeTAM Hugging Face Space](https://huggingface.co/spaces/facebook/EdgeTAM)
+is available for a quick model-only demo.
 
 Install the dependencies for the Gradio demo:
 
@@ -190,7 +236,9 @@ This creates three optimized CoreML models:
 
 ## License
 
-The EdgeTAM model checkpoints and code are licensed under [Apache 2.0](./LICENSE).
+streamSAM and the inherited EdgeTAM code are licensed under
+[Apache 2.0](./LICENSE). EdgeTAM model and checkpoint attribution remains with
+the original authors.
 
 
 ## Citing EdgeTAM

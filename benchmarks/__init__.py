@@ -1,1 +1,1 @@
-"""Benchmark entry points and artifact models for EdgeTAM video inference."""
+"""Benchmark entry points and artifact models for streamSAM video inference."""

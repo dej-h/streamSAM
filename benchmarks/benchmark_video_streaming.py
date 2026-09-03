@@ -235,7 +235,7 @@ class ModeResult:
 
 def parse_arguments(argv: Sequence[str] | None = None) -> CliArguments:
     parser = argparse.ArgumentParser(
-        description="Measure the existing eager EdgeTAM video paths before streaming changes."
+        description="Measure eager and bounded streamSAM video inference paths."
     )
     parser.add_argument(
         "--mode",

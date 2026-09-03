@@ -24,7 +24,7 @@ from sam2.build_sam import build_sam2_video_predictor
 from sam2.utils.video_output_writer import BoundedVideoMaskWriter
 
 # Description
-title = "<center><strong><font size='8'>EdgeTAM<font></strong> <a href='https://github.com/facebookresearch/EdgeTAM'><font size='6'>[GitHub]</font></a> </center>"
+title = "<center><strong><font size='8'>streamSAM<font></strong> <a href='https://github.com/dej-h/streamSAM'><font size='6'>[GitHub]</font></a> </center>"
 
 description_p = """# Instructions
                 <ol>
@@ -197,7 +197,7 @@ def preprocess_video_in(video_path, session_state):
         predictor.close_video_source(inference_state)
         raise gr.Error(
             "Video frame-count metadata changed while initializing the stream: "
-            f"OpenCV reported {reported_frame_count}, EdgeTAM reported "
+            f"OpenCV reported {reported_frame_count}, streamSAM reported "
             f"{metadata.frame_count}."
         )
 
