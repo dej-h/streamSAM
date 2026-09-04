@@ -44,11 +44,10 @@ The `export_to_coreml.py` script exports EdgeTAM models to CoreML format for on-
 pip install -e ".[coreml]"
 
 # Export EdgeTAM to CoreML
-python ./tools/export_to_coreml.py \
+python3 ./coreml/export_to_coreml.py \
   --sam2_cfg sam2/configs/edgetam.yaml \
   --sam2_checkpoint ./checkpoints/edgetam.pt \
-  --output_dir ./coreml_models \
-  --validate
+  --output_dir ./coreml_models
 ```
 
 The script creates three CoreML models optimized for on-device inference:

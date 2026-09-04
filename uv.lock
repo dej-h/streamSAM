@@ -4474,6 +4474,7 @@ dependencies = [
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "opencv-python" },
     { name = "pillow" },
+    { name = "timm" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
@@ -4483,7 +4484,6 @@ dependencies = [
 coreml = [
     { name = "coremltools" },
     { name = "pillow" },
-    { name = "timm" },
 ]
 dev = [
     { name = "black" },
@@ -4507,7 +4507,6 @@ gradio = [
     { name = "moviepy" },
     { name = "opencv-python" },
     { name = "pydantic" },
-    { name = "timm" },
 ]
 notebooks = [
     { name = "eva-decord" },
@@ -4522,7 +4521,6 @@ benchmark = [
     { name = "eva-decord" },
     { name = "nvidia-ml-py" },
     { name = "opencv-python" },
-    { name = "timm" },
 ]
 
 [package.metadata]
@@ -4554,8 +4552,7 @@ requires-dist = [
     { name = "submitit", marker = "extra == 'dev'", specifier = ">=1.5.1" },
     { name = "tensorboard", marker = "extra == 'dev'", specifier = ">=2.17.0" },
     { name = "tensordict", marker = "extra == 'dev'", specifier = ">=0.5.0" },
-    { name = "timm", marker = "extra == 'coreml'", specifier = "==1.0.15" },
-    { name = "timm", marker = "extra == 'gradio'", specifier = "==1.0.15" },
+    { name = "timm", specifier = "==1.0.15" },
     { name = "torch", specifier = ">=2.3.1" },
     { name = "torchvision", specifier = ">=0.18.1" },
     { name = "tqdm", specifier = ">=4.66.1" },
@@ -4569,7 +4566,6 @@ benchmark = [
     { name = "eva-decord", specifier = ">=0.6.1" },
     { name = "nvidia-ml-py", specifier = ">=13.610.43" },
     { name = "opencv-python", specifier = ">=4.7.0" },
-    { name = "timm", specifier = "==1.0.15" },
 ]
 
 [[package]]
