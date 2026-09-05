@@ -2,7 +2,11 @@
 
 Bounded video streaming for the SAM2 model family.
 
-[![streamSAM benchmark: segmentation beside synchronized FPS, VRAM, and RSS telemetry](docs/assets/streamsam-benchmark-poster.jpg)](docs/assets/streamsam-benchmark.mp4)
+
+
+https://github.com/user-attachments/assets/887fefa0-2245-440e-8012-15dd3cb26fb5
+
+
 
 streamSAM keeps video decode, CPU queues, GPU staging, temporal inference, and
 output writing bounded as a video grows. It retains the existing `sam2` Python
