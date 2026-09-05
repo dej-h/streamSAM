@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from benchmarks.render_benchmark_comparison import RenderOptions, render_comparison
+from benchmarks.video.render_benchmark_comparison import RenderOptions, render_comparison
 
 
 def _write_json(path: Path, value: object) -> None:

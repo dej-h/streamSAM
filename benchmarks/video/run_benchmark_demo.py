@@ -12,10 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Mapping, Sequence, cast
 
-from benchmarks.render_benchmark_comparison import RenderOptions, render_comparison
+from benchmarks.video.render_benchmark_comparison import RenderOptions, render_comparison
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 BenchmarkMode = Literal["core-eager", "demo-chunked", "demo-streaming"]
 DTypeName = Literal["float32", "float16", "bfloat16"]
 

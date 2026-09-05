@@ -61,7 +61,7 @@ uv sync --group benchmark
 Run a 200-frame end-to-end comparison with the bundled example:
 
 ```bash
-uv run --group benchmark python3 -m benchmarks.run_benchmark_demo \
+uv run --group benchmark python3 -m benchmarks.video.run_benchmark_demo \
   --video examples/01_dog.mp4 \
   --prompt examples/prompts/01_dog.json \
   --max-frames 200 \
@@ -73,6 +73,9 @@ The runner executes the original eager loader, independent 96-frame batches,
 and streamSAM with the same source, checkpoint, prompt, dtype, and frame limit.
 It writes raw frame and memory telemetry, subprocess logs, summaries, and a
 synchronized replay under `benchmark_artifacts/demo_comparison/`.
+
+See [`benchmarks/README.md`](benchmarks/README.md) for measurement tools,
+video rendering, and CPU/CUDA contract checks.
 
 To repeat the published workload, use an input with at least 1,000 frames and
 change `--max-frames` to `1000`. The bundled dog clip has 289 frames. The table

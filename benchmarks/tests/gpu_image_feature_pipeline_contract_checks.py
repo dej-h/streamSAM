@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -15,15 +16,17 @@ from sam2.utils.video_stream import create_video_frame_source
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Check bounded CUDA image feature production against decoded frames."
+    )
+    parser.add_argument("--video", type=Path, required=True)
+    arguments = parser.parse_args()
+    video_path = Path(arguments.video)
     if not torch.cuda.is_available():
         raise RuntimeError("GPU image feature contract requires CUDA")
     device = torch.device("cuda")
     source = create_video_frame_source(
-        video_path=str(
-            Path(
-                "benchmark_artifacts/video_matrix/20260818T130314Z/inputs/dog.mp4"
-            )
-        ),
+        video_path=str(video_path),
         image_size=256,
         offload_video_to_cpu=True,
         loading_mode="lazy",
@@ -60,7 +63,7 @@ def main() -> None:
     compared = 0
     try:
         pipeline.prefetch(0)
-        for frame_idx in range(32):
+        for frame_idx in range(min(len(source), 32)):
             feature = pipeline.acquire(frame_idx)
             pipeline.prefetch(frame_idx + 1)
             expected = source[frame_idx].to(device)
