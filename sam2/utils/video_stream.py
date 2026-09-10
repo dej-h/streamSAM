@@ -44,14 +44,17 @@ class FrameSourceStats:
     closed: bool
 
 
-@runtime_checkable
-class FrameSource(Protocol):
-    @property
-    def metadata(self) -> FrameSourceMetadata: ...
-
+class FrameStorage(Protocol):
+    """Indexed tensor access shared by eager tensors, loaders and frame sources."""
     def __len__(self) -> int: ...
 
-    def __getitem__(self, index: int) -> torch.Tensor: ...
+    def __getitem__(self, index: int, /) -> torch.Tensor: ...
+
+
+@runtime_checkable
+class FrameSource(FrameStorage, Protocol):
+    @property
+    def metadata(self) -> FrameSourceMetadata: ...
 
     def stats(self) -> FrameSourceStats: ...
 
@@ -61,7 +64,7 @@ class FrameSource(Protocol):
 class EagerFrameSource:
     def __init__(
         self,
-        frames: Sequence[torch.Tensor],
+        frames: FrameStorage,
         metadata: FrameSourceMetadata,
     ) -> None:
         if len(frames) != metadata.frame_count:
@@ -339,37 +342,29 @@ class SequentialMp4FrameSource:
             raise RuntimeError("frame source is closed")
 
 
-class SequentialImageDirectoryFrameSource:
-    """Prefetch normalized numbered image frames through a bounded CPU queue."""
+class SequentialImageFrameSource:
+    """Prefetch images from a borrowed, stable path sequence into a bounded queue.
 
-    _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".JPG", ".JPEG"})
+    The sequence must support concurrent reads and outlive this source. Its
+    contents are never copied. One consumer may request arbitrary frame indices;
+    a future decode failure cannot invalidate an earlier buffered frame.
+    """
 
     def __init__(
         self,
-        video_path: str,
+        frame_paths: Sequence[Path],
         image_size: int,
         capacity: int,
-        img_mean: RgbMean,
-        img_std: RgbStd,
+        img_mean: RgbMean = (0.485, 0.456, 0.406),
+        img_std: RgbStd = (0.229, 0.224, 0.225),
     ) -> None:
         if image_size <= 0:
             raise ValueError("image size must be positive")
         if capacity <= 0:
             raise ValueError("frame source capacity must be positive")
 
-        image_directory = Path(video_path).expanduser().resolve()
-        if not image_directory.is_dir():
-            raise NotADirectoryError(image_directory)
-        frame_paths = sorted(
-            (
-                path
-                for path in image_directory.iterdir()
-                if path.suffix in self._IMAGE_SUFFIXES
-            ),
-            key=lambda path: int(path.stem),
-        )
         if not frame_paths:
-            raise RuntimeError(f"no numbered JPEG images found in {image_directory}")
+            raise ValueError("image source needs at least one frame")
 
         _, video_height, video_width = _load_img_as_tensor(
             str(frame_paths[0]), image_size
@@ -384,7 +379,7 @@ class SequentialImageDirectoryFrameSource:
                 image_size, img_mean, img_std
             ),
         )
-        self._frame_paths = tuple(frame_paths)
+        self._frame_paths = frame_paths
         self._capacity = capacity
         self._mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
         self._std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
@@ -393,7 +388,7 @@ class SequentialImageDirectoryFrameSource:
         self._next_decode_index = 0
         self._inflight_index: int | None = None
         self._generation = 0
-        self._worker_error: BaseException | None = None
+        self._worker_error: tuple[int, BaseException] | None = None
         self._closed = False
         self._decoded_frames = 0
         self._seek_count = 0
@@ -402,7 +397,7 @@ class SequentialImageDirectoryFrameSource:
         self._maximum_depth = 0
         self._worker = Thread(
             target=self._decode_loop,
-            name="sam2-image-directory-decoder",
+            name="sam2-image-decoder",
             daemon=True,
         )
         self._worker.start()
@@ -421,24 +416,23 @@ class SequentialImageDirectoryFrameSource:
         wait_started_at = time.perf_counter()
         waited = False
         with self._condition:
-            self._raise_worker_error_locked()
             if self._closed:
                 raise RuntimeError("frame source is closed")
-            if (
-                index not in self._frames
-                and index != self._inflight_index
-                and index != self._next_decode_index
-            ):
-                self._generation += 1
-                self._frames.clear()
-                self._next_decode_index = index
-                self._seek_count += 1
-                self._condition.notify_all()
-
             while index not in self._frames:
-                self._raise_worker_error_locked()
+                self._raise_frame_error_locked(index)
                 if self._closed:
                     raise RuntimeError("frame source closed before frame was decoded")
+                if index != self._inflight_index:
+                    # Clear unwanted queued frames even if this is the next
+                    # decode index: a full queue would otherwise block both
+                    # producer and consumer. Supersede an unrelated in-flight
+                    # decode so its later failure cannot stall this request.
+                    self._generation += 1
+                    self._frames.clear()
+                    self._worker_error = None
+                    self._next_decode_index = index
+                    self._seek_count += 1
+                    self._condition.notify_all()
                 waited = True
                 self._condition.wait()
 
@@ -472,64 +466,97 @@ class SequentialImageDirectoryFrameSource:
         self._worker.join()
 
     def _decode_loop(self) -> None:
-        try:
-            while True:
-                with self._condition:
-                    while (
-                        not self._closed
-                        and (
-                            len(self._frames) >= self._capacity
-                            or self._next_decode_index >= len(self)
-                        )
-                    ):
-                        self._condition.wait()
-                    if self._closed:
-                        return
-                    frame_idx = self._next_decode_index
-                    self._inflight_index = frame_idx
-                    generation = self._generation
-                    self._next_decode_index += 1
-
-                frame, height, width = _load_img_as_tensor(
-                    str(self._frame_paths[frame_idx]), self._metadata.image_size
-                )
-                if (
-                    height != self._metadata.video_height
-                    or width != self._metadata.video_width
-                ):
-                    raise ValueError(
-                        f"frame {frame_idx} has dimensions {width}x{height}; expected "
-                        f"{self._metadata.video_width}x{self._metadata.video_height}"
-                    )
-                # The eager JPEG loader copies PIL's float64 tensor into a float32
-                # batch before normalization. Match that ordering exactly so lazy
-                # directory input is mask-equivalent to the existing core path.
-                frame = frame.to(dtype=torch.float32)
-                frame.sub_(self._mean).div_(self._std)
-
-                with self._condition:
-                    if self._closed:
-                        return
-                    if generation != self._generation:
-                        if self._inflight_index == frame_idx:
-                            self._inflight_index = None
-                        self._condition.notify_all()
-                        continue
-                    self._frames[frame_idx] = frame
-                    self._inflight_index = None
-                    self._decoded_frames += 1
-                    self._maximum_depth = max(
-                        self._maximum_depth, len(self._frames)
-                    )
-                    self._condition.notify_all()
-        except BaseException as error:
+        while True:
             with self._condition:
-                self._worker_error = error
+                while (
+                    not self._closed
+                    and (
+                        len(self._frames) >= self._capacity
+                        or self._next_decode_index >= len(self)
+                        or self._worker_error is not None
+                    )
+                ):
+                    self._condition.wait()
+                if self._closed:
+                    return
+                frame_idx = self._next_decode_index
+                self._inflight_index = frame_idx
+                generation = self._generation
+                self._next_decode_index += 1
+
+            try:
+                frame = self._decode_frame(frame_idx)
+            except BaseException as error:
+                with self._condition:
+                    if generation == self._generation:
+                        self._worker_error = (frame_idx, error)
+                    self._inflight_index = None
+                    self._condition.notify_all()
+                continue
+
+            with self._condition:
+                if self._closed:
+                    return
+                if generation != self._generation:
+                    if self._inflight_index == frame_idx:
+                        self._inflight_index = None
+                    self._condition.notify_all()
+                    continue
+                self._frames[frame_idx] = frame
+                self._inflight_index = None
+                self._decoded_frames += 1
+                self._maximum_depth = max(
+                    self._maximum_depth, len(self._frames)
+                )
                 self._condition.notify_all()
 
-    def _raise_worker_error_locked(self) -> None:
-        if self._worker_error is not None:
-            raise RuntimeError("image-directory decoder failed") from self._worker_error
+    def _decode_frame(self, frame_idx: int) -> torch.Tensor:
+        frame, height, width = _load_img_as_tensor(
+            str(self._frame_paths[frame_idx]), self._metadata.image_size
+        )
+        if (height, width) != (self._metadata.video_height, self._metadata.video_width):
+            raise ValueError(
+                f"frame {frame_idx} has dimensions {width}x{height}; expected "
+                f"{self._metadata.video_width}x{self._metadata.video_height}"
+            )
+        # Match the eager JPEG loader's float64 -> float32 -> normalize ordering.
+        frame = frame.to(dtype=torch.float32)
+        return frame.sub_(self._mean).div_(self._std)
+
+    def _raise_frame_error_locked(self, index: int) -> None:
+        if self._worker_error is not None and self._worker_error[0] == index:
+            raise RuntimeError(f"image decoder failed at frame {index}") from self._worker_error[1]
+
+
+class SequentialImageDirectoryFrameSource(SequentialImageFrameSource):
+    """Compatibility input for numbered JPEG directories; paths are materialized."""
+
+    _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".JPG", ".JPEG"})
+
+    def __init__(self, video_path: str, image_size: int, capacity: int,
+                 img_mean: RgbMean, img_std: RgbStd) -> None:
+        directory = Path(video_path).expanduser().resolve()
+        if not directory.is_dir():
+            raise NotADirectoryError(directory)
+        paths = sorted((p for p in directory.iterdir() if p.suffix in self._IMAGE_SUFFIXES),
+                       key=lambda p: int(p.stem))
+        if not paths:
+            raise RuntimeError(f"no numbered JPEG images found in {directory}")
+        super().__init__(paths, image_size, capacity, img_mean, img_std)
+
+
+def validate_frame_source(source: FrameSource, image_size: int) -> None:
+    """Check the normalized input contract before allocating predictor state."""
+    metadata = source.metadata
+    if len(source) <= 0 or metadata.frame_count != len(source):
+        raise ValueError("frame source must have a positive, matching frame count")
+    if min(metadata.video_height, metadata.video_width) <= 0:
+        raise ValueError("frame source dimensions must be positive")
+    expected = _preprocessing_identity(image_size, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    if metadata.image_size != image_size or metadata.preprocessing_identity != expected:
+        raise ValueError("frame source preprocessing does not match the predictor")
+    if source.stats().closed:
+        raise ValueError("frame source is already closed")
 
 
 def create_video_frame_source(
@@ -605,6 +632,8 @@ def create_video_frame_source(
         async_loading_frames=async_loading_frames,
         compute_device=compute_device,
     )
+    if video_height is None or video_width is None:
+        raise ValueError("decoded image dimensions are unavailable")
     return EagerFrameSource(
         frames=frames,
         metadata=FrameSourceMetadata(

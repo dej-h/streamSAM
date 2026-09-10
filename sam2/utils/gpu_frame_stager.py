@@ -16,7 +16,7 @@ from sam2.utils.video_stream import FrameSource
 # staging thread prepares the next frame in the other slot.
 DEFAULT_GPU_STAGING_SLOT_COUNT: Final = 2
 
-_SlotState = Literal["free", "staging", "ready", "in_use", "retiring"]
+_SlotState = Literal["free", "staging", "ready", "in_use", "retiring", "failed"]
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ class _StagingSlot:
     frame_idx: int | None = None
     published_sequence: int = 0
     transfer_timing_pending: bool = False
+    source_error: Exception | None = None
 
 
 class GpuFrameLease:
@@ -169,6 +170,7 @@ class GpuFrameStager:
         self._worker.start()
 
     def prefetch(self, frame_idx: int) -> None:
+        """Best-effort speculation with at most one pending request per slot."""
         if frame_idx < 0 or frame_idx >= len(self._frame_source):
             return
         with self._condition:
@@ -177,6 +179,8 @@ class GpuFrameStager:
                 raise RuntimeError("GPU frame stager is closed")
             if self._is_resident_locked(frame_idx) or frame_idx in self._pending_index_set:
                 self._resident_hits += 1
+                return
+            if len(self._pending_indices) >= len(self._slots):
                 return
             self._pending_indices.append(frame_idx)
             self._pending_index_set.add(frame_idx)
@@ -206,6 +210,9 @@ class GpuFrameStager:
                 self._raise_worker_error_locked()
                 if self._closed:
                     raise RuntimeError("GPU frame stager is closed")
+                failed = next((s for s in self._slots if s.frame_idx == frame_idx and s.state == "failed"), None)
+                if failed is not None:
+                    raise RuntimeError(f"GPU source failed at frame {frame_idx}") from failed.source_error
                 slot = self._ready_slot_locked(frame_idx)
                 if slot is not None:
                     slot.state = "in_use"
@@ -217,6 +224,9 @@ class GpuFrameStager:
                     else:
                         self._resident_hits += 1
                     break
+                # A speculative request may have been dropped at capacity or
+                # its ready/failed slot recycled before the consumer woke up.
+                self.prefetch(frame_idx)
                 waited = True
                 self._condition.wait()
 
@@ -289,8 +299,21 @@ class GpuFrameStager:
                     frame_idx, slot, previous_state = reservation
 
                 self._prepare_slot_for_write(slot, previous_state)
-                source_frame = self._frame_source[frame_idx]
-                self._validate_source_frame(source_frame, slot)
+                try:
+                    source_frame = self._frame_source[frame_idx]
+                    self._validate_source_frame(source_frame, slot)
+                except Exception as error:
+                    # An unreadable future input is local to this frame. Keep
+                    # the failure in its bounded slot until acquired/recycled;
+                    # other ready frames remain usable. CUDA failures below
+                    # still terminate the worker and invalidate the stager.
+                    with self._condition:
+                        slot.source_error = error
+                        slot.state = "failed"
+                        self._published_sequence += 1
+                        slot.published_sequence = self._published_sequence
+                        self._condition.notify_all()
+                    continue
 
                 host_copy_started_at = time.perf_counter()
                 slot.host_tensor.copy_(source_frame)
@@ -339,6 +362,7 @@ class GpuFrameStager:
                     previous_state = slot.state
                     slot.state = "staging"
                     slot.frame_idx = frame_idx
+                    slot.source_error = None
                     return frame_idx, slot, previous_state
             self._condition.wait()
 
@@ -347,7 +371,7 @@ class GpuFrameStager:
             for slot in self._slots:
                 if slot.state == state:
                     return slot
-        ready_slots = [slot for slot in self._slots if slot.state == "ready"]
+        ready_slots = [slot for slot in self._slots if slot.state in ("ready", "failed")]
         if ready_slots:
             return min(ready_slots, key=lambda slot: slot.published_sequence)
         return None
@@ -401,7 +425,7 @@ class GpuFrameStager:
     def _is_resident_locked(self, frame_idx: int) -> bool:
         return any(
             slot.frame_idx == frame_idx
-            and slot.state in ("staging", "ready", "in_use")
+            and slot.state in ("staging", "ready", "in_use", "failed")
             for slot in self._slots
         )
 

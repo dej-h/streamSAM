@@ -13,6 +13,10 @@ from typing import Final, Generator, Iterator, Literal
 import torch
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
+from sam2.utils.geometry_delta import add_geometry_delta
+from sam2.utils.forward_history import (
+    ForwardHistoryPolicy, ForwardHistoryRetention, ForwardHistoryStats, discard_before,
+)
 from sam2.utils.gpu_frame_stager import (
     DEFAULT_GPU_STAGING_SLOT_COUNT,
     GpuFrameLease,
@@ -28,6 +32,7 @@ from sam2.utils.video_stream import (
     FrameLoadingMode,
     FrameSource,
     create_video_frame_source,
+    validate_frame_source,
 )
 
 from tqdm import tqdm
@@ -43,6 +48,17 @@ FrameOutput = dict[str, FrameOutputValue]
 FrameStorageKey = Literal["cond_frame_outputs", "non_cond_frame_outputs"]
 
 
+def _store_inference_tensor(tensor: torch.Tensor, storage_device: torch.device | str) -> torch.Tensor:
+    """Publish storage tensors ready for immediate use on their destination.
+
+    CPU consumers include prompt consolidation and public score clones. They
+    cannot observe CUDA stream ordering, so a device-to-host copy must finish
+    before returning. GPU consumers retain the existing asynchronous transfers.
+    """
+    destination = torch.device(storage_device)
+    return tensor.to(destination, non_blocking=destination.type != "cpu")
+
+
 @dataclass(frozen=True)
 class VideoFramePrediction:
     """A frame prediction that has not yet been committed to SAM2 memory.
@@ -51,12 +67,20 @@ class VideoFramePrediction:
     :meth:`SAM2VideoPredictor.commit_video_frame` before requesting the next
     prediction. Passing replacement logits to that method changes both the
     emitted mask and the memory consumed by subsequent frames.
+
+    ``memory_mask_logits`` exposes a copy of the native memory-encoder input
+    for an ordinary tracked frame, or ``None`` for an already encoded prompt.
+    ``geometry_mask_delta`` adds evidence to this native representation without
+    classifying it as a user prompt. ``object_score_logits`` is the unchanged
+    model presence estimate, available to a visibility-aware controller.
     """
 
     frame_idx: int
     object_ids: tuple[int, ...]
     mask_logits: torch.Tensor
     _commit_token: object = field(repr=False, compare=False)
+    memory_mask_logits: torch.Tensor | None = field(default=None, repr=False)
+    object_score_logits: torch.Tensor | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -108,7 +132,7 @@ class SAM2VideoPredictor(SAM2Base):
     @torch.inference_mode()
     def init_state(
         self,
-        video_path: str | bytes,
+        video_path: str | bytes | None = None,
         offload_video_to_cpu: bool = False,
         offload_state_to_cpu: bool = False,
         async_loading_frames: bool = False,
@@ -118,127 +142,207 @@ class SAM2VideoPredictor(SAM2Base):
         gpu_frame_staging_slots: int = DEFAULT_GPU_STAGING_SLOT_COUNT,
         enable_concurrent_image_encoder: bool = False,
         gpu_stage_profiler: GpuStageProfiler | None = None,
+        *,
+        frame_source: FrameSource | None = None,
     ):
-        """Initialize an inference state."""
-        compute_device = self.device  # device of the model
-        if frame_loading == "lazy":
-            offload_video_to_cpu = True
-        frame_source = create_video_frame_source(
-            video_path=video_path,
-            image_size=self.image_size,
-            offload_video_to_cpu=offload_video_to_cpu,
-            loading_mode=frame_loading,
-            buffer_capacity=frame_buffer_size,
-            async_loading_frames=async_loading_frames,
-            compute_device=compute_device,
-        )
-        inference_state = {}
-        inference_state["images"] = frame_source
-        inference_state["frame_source"] = frame_source
-        inference_state["num_frames"] = len(frame_source)
-        # whether to offload the video frames to CPU memory
-        # turning on this option saves the GPU memory with only a very small overhead
-        inference_state["offload_video_to_cpu"] = offload_video_to_cpu
-        # whether to offload the inference state to CPU memory
-        # turning on this option saves the GPU memory at the cost of a lower tracking fps
-        # (e.g. in a test case of 768x768 model, fps dropped from 27 to 24 when tracking one object
-        # and from 24 to 21 when tracking two objects)
-        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
-        # the original video height and width, used for resizing final output scores
-        inference_state["video_height"] = frame_source.metadata.video_height
-        inference_state["video_width"] = frame_source.metadata.video_width
-        inference_state["device"] = compute_device
-        inference_state["frame_stager"] = (
-            GpuFrameStager(
-                frame_source=frame_source,
-                device=compute_device,
-                slot_count=gpu_frame_staging_slots,
-            )
-            if frame_loading == "lazy"
-            and enable_gpu_frame_staging
-            and compute_device.type == "cuda"
-            else None
-        )
-        inference_state["active_frame_lease"] = None
-        inference_state["pending_frame_commit"] = None
-        inference_state["gpu_stage_profiler"] = gpu_stage_profiler
-        if offload_state_to_cpu:
-            inference_state["storage_device"] = torch.device("cpu")
-        else:
-            inference_state["storage_device"] = compute_device
-        # inputs on each frame
-        inference_state["point_inputs_per_obj"] = {}
-        inference_state["mask_inputs_per_obj"] = {}
-        # visual features on a small number of recently visited frames for quick interactions
-        inference_state["cached_features"] = {}
-        # values that don't change across frames (so we only need to hold one copy of them)
-        inference_state["constants"] = {}
-        # mapping between client-side object id and model-side object index
-        inference_state["obj_id_to_idx"] = OrderedDict()
-        inference_state["obj_idx_to_id"] = OrderedDict()
-        inference_state["obj_ids"] = []
-        # A storage to hold the model's tracking results and states on each frame
-        inference_state["output_dict"] = {
-            "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
-            "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
-        }
-        # Slice (view) of each object tracking results, sharing the same memory with "output_dict"
-        inference_state["output_dict_per_obj"] = {}
-        # A temporary storage to hold new outputs when user interact with a frame
-        # to add clicks or mask (it's merged into "output_dict" before propagation starts)
-        inference_state["temp_output_dict_per_obj"] = {}
-        # Frames that already holds consolidated outputs from click or mask inputs
-        # (we directly use their consolidated outputs during tracking)
-        inference_state["consolidated_frame_inds"] = {
-            "cond_frame_outputs": set(),  # set containing frame indices
-            "non_cond_frame_outputs": set(),  # set containing frame indices
-        }
-        # metadata for each tracking frame (e.g. which direction it's tracked)
-        inference_state["tracking_has_started"] = False
-        inference_state["frames_already_tracked"] = {}
-        if enable_concurrent_image_encoder:
-            if not isinstance(inference_state["frame_stager"], GpuFrameStager):
-                raise ValueError(
-                    "concurrent image encoding requires lazy CUDA frame staging"
+        """Initialize from exactly one video path or normalized frame source.
+
+        Once exclusive input validation succeeds, the predictor owns the source
+        and closes it on initialization failure or ``close_video_source``.
+        Caller-owned backing storage must outlive the source.
+        """
+        if (video_path is None) == (frame_source is None):
+            raise ValueError("provide exactly one of video_path and frame_source")
+        inference_state = {"frame_source": frame_source}
+        with contextlib.ExitStack() as cleanup:
+            cleanup.callback(self.close_video_source, inference_state)
+            compute_device = self.device  # device of the model
+            if frame_loading == "lazy":
+                offload_video_to_cpu = True
+            if frame_source is None:
+                assert video_path is not None
+                frame_source = create_video_frame_source(
+                    video_path=video_path,
+                    image_size=self.image_size,
+                    offload_video_to_cpu=offload_video_to_cpu,
+                    loading_mode=frame_loading,
+                    buffer_capacity=frame_buffer_size,
+                    async_loading_frames=async_loading_frames,
+                    compute_device=compute_device,
                 )
-            inference_state["feature_pipeline"] = GpuImageFeaturePipeline(
-                producer=lambda frame_idx: self._encode_image_feature(
-                    inference_state,
-                    frame_idx,
-                    preserve_compiled_outputs=True,
-                ),
-                frame_count=inference_state["num_frames"],
-                device=compute_device,
-                autocast_enabled=torch.is_autocast_enabled("cuda"),
-                autocast_dtype=torch.get_autocast_dtype("cuda"),
-                profiler=gpu_stage_profiler,
+            inference_state["frame_source"] = frame_source
+            validate_frame_source(frame_source, self.image_size)
+            inference_state["images"] = frame_source
+            inference_state["frame_source"] = frame_source
+            inference_state["num_frames"] = len(frame_source)
+            # whether to offload the video frames to CPU memory
+            # turning on this option saves the GPU memory with only a very small overhead
+            inference_state["offload_video_to_cpu"] = offload_video_to_cpu
+            # whether to offload the inference state to CPU memory
+            # turning on this option saves the GPU memory at the cost of a lower tracking fps
+            # (e.g. in a test case of 768x768 model, fps dropped from 27 to 24 when tracking one object
+            # and from 24 to 21 when tracking two objects)
+            inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+            # the original video height and width, used for resizing final output scores
+            inference_state["video_height"] = frame_source.metadata.video_height
+            inference_state["video_width"] = frame_source.metadata.video_width
+            inference_state["device"] = compute_device
+            inference_state["frame_stager"] = (
+                GpuFrameStager(
+                    frame_source=frame_source,
+                    device=compute_device,
+                    slot_count=gpu_frame_staging_slots,
+                )
+                if frame_loading == "lazy"
+                and enable_gpu_frame_staging
+                and compute_device.type == "cuda"
+                else None
             )
-        else:
-            inference_state["feature_pipeline"] = None
-        inference_state["concurrent_encoder_warmup_frames_remaining"] = (
-            FULL_PIPELINE_CONCURRENCY_WARMUP_FRAMES
-            if enable_concurrent_image_encoder
-            and self.compile_video_pipeline_enabled
-            else 0
-        )
-        # Warm up the visual backbone and cache the image feature on frame 0
-        self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
-        return inference_state
+            inference_state["active_frame_lease"] = None
+            inference_state["pending_frame_commit"] = None
+            inference_state["gpu_stage_profiler"] = gpu_stage_profiler
+            if offload_state_to_cpu:
+                inference_state["storage_device"] = torch.device("cpu")
+            else:
+                inference_state["storage_device"] = compute_device
+            # inputs on each frame
+            inference_state["point_inputs_per_obj"] = {}
+            inference_state["mask_inputs_per_obj"] = {}
+            # visual features on a small number of recently visited frames for quick interactions
+            inference_state["cached_features"] = {}
+            # values that don't change across frames (so we only need to hold one copy of them)
+            inference_state["constants"] = {}
+            # mapping between client-side object id and model-side object index
+            inference_state["obj_id_to_idx"] = OrderedDict()
+            inference_state["obj_idx_to_id"] = OrderedDict()
+            inference_state["obj_ids"] = []
+            # A storage to hold the model's tracking results and states on each frame
+            inference_state["output_dict"] = {
+                "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+                "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+            }
+            # Slice (view) of each object tracking results, sharing the same memory with "output_dict"
+            inference_state["output_dict_per_obj"] = {}
+            # A temporary storage to hold new outputs when user interact with a frame
+            # to add clicks or mask (it's merged into "output_dict" before propagation starts)
+            inference_state["temp_output_dict_per_obj"] = {}
+            # Frames that already holds consolidated outputs from click or mask inputs
+            # (we directly use their consolidated outputs during tracking)
+            inference_state["consolidated_frame_inds"] = {
+                "cond_frame_outputs": set(),  # set containing frame indices
+                "non_cond_frame_outputs": set(),  # set containing frame indices
+            }
+            # metadata for each tracking frame (e.g. which direction it's tracked)
+            inference_state["tracking_has_started"] = False
+            inference_state["frames_already_tracked"] = {}
+            if enable_concurrent_image_encoder:
+                if not isinstance(inference_state["frame_stager"], GpuFrameStager):
+                    raise ValueError(
+                        "concurrent image encoding requires lazy CUDA frame staging"
+                    )
+                inference_state["feature_pipeline"] = GpuImageFeaturePipeline(
+                    producer=lambda frame_idx: self._encode_image_feature(
+                        inference_state,
+                        frame_idx,
+                        preserve_compiled_outputs=True,
+                    ),
+                    frame_count=inference_state["num_frames"],
+                    device=compute_device,
+                    autocast_enabled=torch.is_autocast_enabled("cuda"),
+                    autocast_dtype=torch.get_autocast_dtype("cuda"),
+                    profiler=gpu_stage_profiler,
+                )
+            else:
+                inference_state["feature_pipeline"] = None
+            inference_state["concurrent_encoder_warmup_frames_remaining"] = (
+                FULL_PIPELINE_CONCURRENCY_WARMUP_FRAMES
+                if enable_concurrent_image_encoder
+                and self.compile_video_pipeline_enabled
+                else 0
+            )
+            # Warm up the visual backbone and cache the image feature on frame 0
+            self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+            cleanup.pop_all()
+            return inference_state
+
+    @staticmethod
+    def _forward_retention(inference_state) -> ForwardHistoryRetention | None:
+        retention = inference_state.get("forward_history_retention")
+        if retention is not None and not isinstance(retention, ForwardHistoryRetention):
+            raise TypeError("invalid forward history state")
+        return retention
+
+    def _forward_policy(self, max_objects: int) -> ForwardHistoryPolicy:
+        if self.training:
+            raise ValueError("forward history retention requires evaluation mode")
+        return ForwardHistoryPolicy(self.num_maskmem, self.memory_temporal_stride_for_eval,
+                                    self.use_obj_ptrs_in_encoder, self.max_obj_ptrs_in_encoder, max_objects)
+
+    def enable_forward_history(self, inference_state, *, max_objects: int = 1) -> None:
+        """Enable bounded forward tracking before adding initial frame-zero prompts.
+
+        The default interactive/reverse API remains unbounded. This policy pins
+        frame zero and retains a suffix covering both memory selectors. Reset
+        clears the tracking cursor while retaining the configured policy.
+        """
+        if (inference_state["tracking_has_started"] or inference_state["obj_ids"]
+                or inference_state.get("pending_frame_commit") is not None
+                or self._forward_retention(inference_state) is not None):
+            raise RuntimeError("enable forward history once on a fresh state before prompting")
+        inference_state["forward_history_retention"] = ForwardHistoryRetention(self._forward_policy(max_objects))
+
+    def _validate_forward_prompt(self, inference_state, frame_idx: int, obj_id: int) -> None:
+        retention = self._forward_retention(inference_state)
+        if retention is None:
+            return
+        if frame_idx != 0 or inference_state["tracking_has_started"]:
+            raise ValueError("bounded forward history permits only initial frame-zero prompts")
+        if obj_id not in inference_state["obj_id_to_idx"] and len(inference_state["obj_ids"]) >= retention.policy.max_objects:
+            raise ValueError("prompt exceeds bounded forward object capacity")
+
+    def forward_history_stats(self, inference_state) -> ForwardHistoryStats | None:
+        """Report retained outputs after commits; one pending frame is additional."""
+        retention = self._forward_retention(inference_state)
+        if retention is None:
+            return None
+        output = inference_state["output_dict"]
+        return ForwardHistoryStats(
+            retention.policy.non_conditioning_capacity, retention.policy.max_objects,
+            retention.last_committed_frame + 1, retention.evicted_frames,
+            len(output["cond_frame_outputs"]), len(output["non_cond_frame_outputs"]),
+            len(inference_state["frames_already_tracked"]), retention.maximum_non_conditioning_frames)
+
+    def _retain_forward_history(self, inference_state, frame_idx: int) -> None:
+        retention = self._forward_retention(inference_state)
+        if retention is None:
+            return
+        cutoff = retention.policy.cutoff_after(frame_idx)
+        retention.evicted_frames += discard_before(inference_state["output_dict"]["non_cond_frame_outputs"], cutoff)
+        for output in inference_state["output_dict_per_obj"].values():
+            discard_before(output["non_cond_frame_outputs"], cutoff)
+        discard_before(inference_state["frames_already_tracked"], cutoff, pin_zero=True)
+        retention.last_committed_frame = frame_idx
+        retention.maximum_non_conditioning_frames = max(
+            retention.maximum_non_conditioning_frames, len(inference_state["output_dict"]["non_cond_frame_outputs"]))
 
     def close_video_source(self, inference_state) -> None:
-        feature_pipeline = inference_state.get("feature_pipeline")
-        if isinstance(feature_pipeline, GpuImageFeaturePipeline):
-            feature_pipeline.close()
-        active_frame_lease = inference_state.get("active_frame_lease")
-        if isinstance(active_frame_lease, GpuFrameLease):
-            active_frame_lease.release()
-            inference_state["active_frame_lease"] = None
-        frame_stager = inference_state.get("frame_stager")
-        if isinstance(frame_stager, GpuFrameStager):
-            frame_stager.close()
-        frame_source = inference_state.get("frame_source")
-        if isinstance(frame_source, FrameSource):
-            frame_source.close()
+        """Attempt every cleanup, even if an earlier CUDA cleanup fails."""
+        with contextlib.ExitStack() as cleanup:
+            # Register in reverse dependency order: stop feature production,
+            # release its active lease, then close staging and CPU decoding.
+            frame_source = inference_state.get("frame_source")
+            if isinstance(frame_source, FrameSource):
+                cleanup.callback(frame_source.close)
+            frame_stager = inference_state.get("frame_stager")
+            if isinstance(frame_stager, GpuFrameStager):
+                cleanup.callback(frame_stager.close)
+            active_frame_lease = inference_state.get("active_frame_lease")
+            if isinstance(active_frame_lease, GpuFrameLease):
+                cleanup.callback(inference_state.__setitem__, "active_frame_lease", None)
+                cleanup.callback(active_frame_lease.release)
+            feature_pipeline = inference_state.get("feature_pipeline")
+            if isinstance(feature_pipeline, GpuImageFeaturePipeline):
+                cleanup.callback(feature_pipeline.close)
 
     @classmethod
     def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2VideoPredictor":
@@ -312,6 +416,7 @@ class SAM2VideoPredictor(SAM2Base):
         box=None,
     ):
         """Add new points to a frame."""
+        self._validate_forward_prompt(inference_state, frame_idx, obj_id)
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
         point_inputs_per_frame = inference_state["point_inputs_per_obj"][obj_idx]
         mask_inputs_per_frame = inference_state["mask_inputs_per_obj"][obj_idx]
@@ -456,6 +561,7 @@ class SAM2VideoPredictor(SAM2Base):
         mask,
     ):
         """Add new mask to a frame."""
+        self._validate_forward_prompt(inference_state, frame_idx, obj_id)
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
         point_inputs_per_frame = inference_state["point_inputs_per_obj"][obj_idx]
         mask_inputs_per_frame = inference_state["mask_inputs_per_obj"][obj_idx]
@@ -834,6 +940,13 @@ class SAM2VideoPredictor(SAM2Base):
         """
         if inference_state.get("pending_frame_commit") is not None:
             raise RuntimeError("a video frame is already awaiting commit")
+        retention = self._forward_retention(inference_state)
+        if retention is not None:
+            if retention.policy != self._forward_policy(retention.policy.max_objects):
+                raise RuntimeError("memory selector settings changed after retention was configured")
+            if start_frame_idx is None:
+                start_frame_idx = retention.last_committed_frame + 1
+            retention.require_next(start_frame_idx, reverse)
         self.propagate_in_video_preflight(inference_state)
 
         output_dict = inference_state["output_dict"]
@@ -868,6 +981,10 @@ class SAM2VideoPredictor(SAM2Base):
             processing_order = range(start_frame_idx, end_frame_idx + 1)
 
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
+            if retention is not None:
+                if retention.policy != self._forward_policy(retention.policy.max_objects):
+                    raise RuntimeError("memory selector settings changed after retention was configured")
+                retention.require_next(frame_idx, reverse)
             # We skip those frames already in consolidated outputs (these are frames
             # that received input clicks or mask). Note that we cannot directly run
             # batched forward on them via `_run_single_frame_inference` because the
@@ -926,11 +1043,20 @@ class SAM2VideoPredictor(SAM2Base):
                 reverse=reverse,
             )
             inference_state["pending_frame_commit"] = pending
+            object_score_logits = current_out["object_score_logits"]
+            if not isinstance(object_score_logits, torch.Tensor):
+                raise TypeError("pending frame has invalid object-score logits")
             prediction = VideoFramePrediction(
                 frame_idx=frame_idx,
                 object_ids=object_ids,
                 mask_logits=video_res_masks,
                 _commit_token=token,
+                memory_mask_logits=(
+                    pred_masks_high_res.clone()
+                    if pred_masks_high_res is not None
+                    else None
+                ),
+                object_score_logits=object_score_logits.clone(),
             )
             try:
                 yield prediction
@@ -951,12 +1077,21 @@ class SAM2VideoPredictor(SAM2Base):
         prediction: VideoFramePrediction,
         *,
         adjusted_mask_logits: torch.Tensor | None = None,
+        geometry_mask_delta: torch.Tensor | None = None,
     ) -> CommittedVideoFrame:
         """Commit a predicted or replacement mask to the recurrent video state.
 
         Replacement logits must have the same ``[objects, 1, H, W]`` shape as
         ``prediction.mask_logits``. Boolean masks are accepted and converted to
         high-confidence foreground/background logits before memory encoding.
+
+        ``geometry_mask_delta`` instead adds floating-point evidence on the
+        native ``prediction.memory_mask_logits`` grid. It preserves prediction
+        encoding semantics, including the model's object score and pointer.
+        The delta is resized and added to the existing low/video-resolution
+        logits, so a zero delta preserves all three original representations.
+        Geometry is unavailable for already encoded prompt frames. The two
+        adjustment mechanisms are mutually exclusive.
         """
         pending = inference_state.get("pending_frame_commit")
         if not isinstance(pending, _PendingVideoFrameCommit):
@@ -965,8 +1100,19 @@ class SAM2VideoPredictor(SAM2Base):
             raise ValueError("prediction does not match the pending video frame")
         if pending.frame_idx != prediction.frame_idx:
             raise ValueError("prediction frame index does not match the pending frame")
+        if pending.object_ids != prediction.object_ids:
+            raise ValueError("prediction object IDs do not match the pending frame")
+        retention = self._forward_retention(inference_state)
+        if retention is not None:
+            if retention.policy != self._forward_policy(retention.policy.max_objects):
+                raise RuntimeError("memory selector settings changed after retention was configured")
+            retention.require_next(pending.frame_idx, pending.reverse)
+        if adjusted_mask_logits is not None and geometry_mask_delta is not None:
+            raise ValueError("legacy replacement and geometry delta are mutually exclusive")
 
-        current_out = pending.current_out
+        # Prepare a separate output before encoding. Invalid adjustments or an
+        # encoder failure must not mutate the pending prediction's stored masks.
+        current_out = pending.current_out.copy()
         device = inference_state["device"]
         output_mask_logits = prediction.mask_logits
         high_res_masks = pending.pred_masks_high_res
@@ -986,9 +1132,13 @@ class SAM2VideoPredictor(SAM2Base):
                 )
             elif not adjusted_mask_logits.is_floating_point():
                 raise TypeError("adjusted mask logits must be floating point or boolean")
+            if not bool(torch.isfinite(adjusted_mask_logits).all()):
+                raise ValueError("adjusted mask logits must be finite")
             adjusted_mask_logits = adjusted_mask_logits.detach().to(
                 device=device, dtype=torch.float32, non_blocking=True
             )
+            if not bool(torch.isfinite(adjusted_mask_logits).all()):
+                raise ValueError("adjusted mask logits overflowed the memory dtype")
             stored_mask_logits = current_out["pred_masks"]
             if not isinstance(stored_mask_logits, torch.Tensor):
                 raise RuntimeError("The pending frame output has no tensor mask logits")
@@ -1004,10 +1154,36 @@ class SAM2VideoPredictor(SAM2Base):
                 mode="bilinear",
                 align_corners=False,
             )
-            current_out["pred_masks"] = low_res_masks.to(
-                inference_state["storage_device"], non_blocking=True
-            )
+            if not bool(torch.isfinite(low_res_masks).all()) or not bool(torch.isfinite(high_res_masks).all()):
+                raise ValueError("adjusted mask resampling produced nonfinite logits")
+            current_out["pred_masks"] = _store_inference_tensor(
+                low_res_masks, inference_state["storage_device"])
             output_mask_logits = adjusted_mask_logits
+
+        if geometry_mask_delta is not None:
+            if high_res_masks is None or pending.memory_already_encoded:
+                raise ValueError("geometry requires an unencoded prediction with native logits")
+            if geometry_mask_delta.shape != high_res_masks.shape:
+                raise ValueError(
+                    "geometry delta must match native memory shape "
+                    f"{tuple(high_res_masks.shape)}, received {tuple(geometry_mask_delta.shape)}"
+                )
+            if not geometry_mask_delta.is_floating_point():
+                raise TypeError("geometry delta must be floating point logits")
+            if not bool(torch.isfinite(geometry_mask_delta).all()):
+                raise ValueError("geometry delta must be finite")
+            delta = geometry_mask_delta.detach().to(device=device, dtype=high_res_masks.dtype)
+            high_res_masks = high_res_masks + delta
+            stored_mask_logits = current_out["pred_masks"]
+            if not isinstance(stored_mask_logits, torch.Tensor):
+                raise RuntimeError("The pending frame output has no tensor mask logits")
+            corrected_low_res_masks = add_geometry_delta(stored_mask_logits, delta)
+            current_out["pred_masks"] = corrected_low_res_masks
+            output_mask_logits = add_geometry_delta(prediction.mask_logits, delta)
+            if not all(bool(torch.isfinite(value).all()) for value in (
+                high_res_masks, corrected_low_res_masks, output_mask_logits
+            )):
+                raise ValueError("geometry correction produced nonfinite logits")
 
         if not pending.memory_already_encoded or mask_was_adjusted:
             if high_res_masks is None:
@@ -1049,6 +1225,7 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["frames_already_tracked"][pending.frame_idx] = {
             "reverse": pending.reverse
         }
+        self._retain_forward_history(inference_state, pending.frame_idx)
         inference_state["pending_frame_commit"] = None
         return CommittedVideoFrame(
             frame_idx=pending.frame_idx,
@@ -1090,6 +1267,7 @@ class SAM2VideoPredictor(SAM2Base):
         self, inference_state, frame_idx, obj_id, need_output=True
     ):
         """Remove all input points or mask in a specific frame for a given object."""
+        self._validate_forward_prompt(inference_state, frame_idx, obj_id)
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
 
         # Clear the conditioning information on the given frame
@@ -1171,6 +1349,10 @@ class SAM2VideoPredictor(SAM2Base):
 
     def _reset_tracking_results(self, inference_state):
         """Reset all tracking inputs and results across the videos."""
+        retention = self._forward_retention(inference_state)
+        if retention is not None:
+            retention.reset()
+            inference_state["pending_frame_commit"] = None
         for v in inference_state["point_inputs_per_obj"].values():
             v.clear()
         for v in inference_state["mask_inputs_per_obj"].values():
@@ -1353,23 +1535,21 @@ class SAM2VideoPredictor(SAM2Base):
         maskmem_features = current_out["maskmem_features"]
         if maskmem_features is not None:
             maskmem_features = maskmem_features.to(torch.bfloat16)
-            maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
+            maskmem_features = _store_inference_tensor(maskmem_features, storage_device)
         pred_masks_gpu = current_out["pred_masks"]
         # potentially fill holes in the predicted masks
         if self.fill_hole_area > 0:
             pred_masks_gpu = fill_holes_in_mask_scores(
                 pred_masks_gpu, self.fill_hole_area
             )
-        pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
+        pred_masks = _store_inference_tensor(pred_masks_gpu, storage_device)
         # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
         maskmem_pos_enc = self._get_maskmem_pos_enc(inference_state, current_out)
         # Object pointers are small individually but one is retained per frame. Store
         # them with the rest of the inference state so long videos do not grow VRAM;
         # memory attention moves only its bounded selected pointer window to CUDA.
-        obj_ptr = current_out["obj_ptr"].to(storage_device, non_blocking=True)
-        object_score_logits = current_out["object_score_logits"].to(
-            storage_device, non_blocking=True
-        )
+        obj_ptr = _store_inference_tensor(current_out["obj_ptr"], storage_device)
+        object_score_logits = _store_inference_tensor(current_out["object_score_logits"], storage_device)
         # make a compact version of this frame's output to reduce the state size
         compact_current_out = {
             "maskmem_features": maskmem_features,
@@ -1417,7 +1597,7 @@ class SAM2VideoPredictor(SAM2Base):
         # optionally offload the output to CPU memory to save GPU space
         storage_device = inference_state["storage_device"]
         maskmem_features = maskmem_features.to(torch.bfloat16)
-        maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
+        maskmem_features = _store_inference_tensor(maskmem_features, storage_device)
         # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
         maskmem_pos_enc = self._get_maskmem_pos_enc(
             inference_state, {"maskmem_pos_enc": maskmem_pos_enc}
@@ -1462,6 +1642,7 @@ class SAM2VideoPredictor(SAM2Base):
         Remove an object id from the tracking state. If strict is True, we check whether
         the object id actually exists and raise an error if it doesn't exist.
         """
+        self._validate_forward_prompt(inference_state, 0, obj_id)
         old_obj_idx_to_rm = inference_state["obj_id_to_idx"].get(obj_id, None)
         updated_frames = []
         # Check whether this object_id to remove actually exists and possibly raise an error.
