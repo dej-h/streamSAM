@@ -43,6 +43,28 @@ without running inference. Pass `--original-run`, `--chunked-run`,
 Rendering requires CPU video decoding and encoding, but no CUDA or checkpoint.
 Playback speed changes the replay, not the recorded measurements.
 
+## Published comparison
+
+The bundled dog clip has 289 frames. To repeat a 1,000-frame workload, use an
+input with at least 1,000 frames and change `--max-frames` to `1000`. The
+repository reproduces the method but does not ship the exact source video used
+for the numbers below.
+
+One matched local run on an NVIDIA GeForce RTX 5060 Laptop GPU with BF16 and no
+compilation produced:
+
+| Execution strategy | Result | End-to-end FPS | Peak process RSS |
+| --- | ---: | ---: | ---: |
+| Original eager loading | Safety stop before frame 1 | n/a | 4.5 GiB limit |
+| Independent 96-frame batches | 1,000 / 1,000 frames | 17.46 | 4.40 GiB |
+| streamSAM | 1,000 / 1,000 frames | **24.49** | **2.52 GiB** |
+
+The eager run was stopped at the configured host RSS limit before it could
+materialize the complete input tensor. This was a recorded safety stop, not a
+CUDA out-of-memory result. The numbers describe this one matched run, not a
+cross-hardware performance claim. The implementation and lower-level profiling
+notes are in [`SAM2_GPU_STREAMING_PIPELINE.md`](../docs/SAM2_GPU_STREAMING_PIPELINE.md).
+
 ## Contract checks
 
 The checks in `tests/` are executable modules. They raise an error on failure.
