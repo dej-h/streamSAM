@@ -1,104 +1,83 @@
 # streamSAM
 
-Bounded video streaming for the SAM2 model family.
-
-
+Track longer videos with SAM 2 without loading every frame into memory first.
 
 https://github.com/user-attachments/assets/887fefa0-2245-440e-8012-15dd3cb26fb5
 
+## What it enables
 
+streamSAM processes finite video files frame by frame. It avoids preloading the
+whole file, bounds decode, CPU queues, resizing, GPU staging, and output writing,
+and carries SAM 2 temporal state between frames.
 
-streamSAM keeps video decode, CPU queues, GPU staging, temporal inference, and
-output writing bounded as a video grows. It retains the existing `sam2` Python
-API and puts the streaming work around the predictor instead of introducing a
-second model API.
+In a 1,000-frame benchmark with EdgeTAM (a SAM 2 variant optimized for on-device
+video segmentation), the standard eager loader exhausted the benchmark's
+4.5 GiB RAM budget before inference started, so it has no comparable speed
+result. Of the methods that completed, streamSAM was faster and used less RAM
+than independent 96-frame batches.
 
-EdgeTAM is the currently verified model. The adapter boundaries are intended to
-support other SAM2-family models, but compatibility with those models has not
-been validated yet.
+The predictor still retains per-frame results, so its state can grow as a video
+gets longer. streamSAM keeps the existing `sam2` API and checkpoint format.
+Existing SAM 2 code can opt into lazy loading with `frame_loading="lazy"`.
 
-## What it adds
+streamSAM supports Meta's SAM 2 model family. It has been tested with EdgeTAM,
+Meta SAM 2 tiny, and SAM 2.1 tiny. Other SAM 2 models use the same predictor
+framework and are expected to work, but have not been directly tested.
 
-- Lazy frame sources with bounded decode queues and backpressure.
-- Reusable pinned-memory and GPU staging slots with explicit CUDA ownership.
-- Optional one-frame-ahead image feature production.
-- A predict-then-commit API for changing a mask before it enters temporal memory.
-- Bounded asynchronous video output, GPU timings, NVTX ranges, and Perfetto traces.
-- Contract checks and matched benchmark tooling for throughput, memory, and mask
-  fidelity.
+## How it is built
 
-## Install
+A lazy frame source feeds a bounded decode queue with backpressure. Frames pass
+through reusable pinned CPU memory and GPU staging slots with explicit ownership.
+Optional one-frame-ahead image feature production overlaps work between frames.
+Predict-then-commit lets a mask be changed before it enters temporal memory, and
+an asynchronous writer bounds video output.
 
-streamSAM requires Python 3.10 or newer, PyTorch 2.3.1 or newer, and a CUDA-capable
-machine for the measured streaming path. Install PyTorch for your CUDA version
-first, then install the repository:
+## Try it locally
+
+The repository includes `edgetam.yaml`, an EdgeTAM checkpoint, and example
+videos, so you can try the demo before adding streamSAM to another project.
+Use Python 3.10 or newer and a
+[CUDA-capable NVIDIA GPU](https://developer.nvidia.com/cuda/gpus) for the
+measured streaming path. [uv](https://docs.astral.sh/uv/) installs from the
+committed lockfile:
 
 ```bash
 git clone https://github.com/dej-h/streamSAM.git
 cd streamSAM
-python3 -m pip install -e .
+uv sync --extra gradio
+uv run --extra gradio python3 gradio_app.py
 ```
 
-The repository includes the verified EdgeTAM configuration and checkpoint. The
-EdgeTAM backbone may download its pretrained TIMM weights on first use.
+Upload a video or choose an example, mark the object with an include point, then
+click **Track**. The EdgeTAM backbone may download pretrained TIMM weights on
+first use.
 
-For the local Gradio demo:
+If you manage your own Python and PyTorch environment, install the package with
+`python3 -m pip install -e .`. To run the bundled demo, install the `gradio`
+extra instead:
 
 ```bash
 python3 -m pip install -e ".[gradio]"
 python3 gradio_app.py
 ```
 
-## Reproduce the benchmark
+Pip uses `pyproject.toml` and the retained `setup.py` for the CUDA extension.
 
-Install the locked benchmark environment with
-[uv](https://docs.astral.sh/uv/):
+## Run the benchmark
 
-```bash
-uv sync --group benchmark
-```
-
-Run a 200-frame end-to-end comparison with the bundled example:
+The bundled comparison runs eager loading, independent batches, and streamSAM
+on the same video and prompt:
 
 ```bash
 uv run --group benchmark python3 -m benchmarks.video.run_benchmark_demo \
   --video examples/01_dog.mp4 \
   --prompt examples/prompts/01_dog.json \
   --max-frames 200 \
-  --original-rss-safety-limit-gib 4.5 \
-  --playback-speed 2
+  --original-rss-safety-limit-gib 4.5
 ```
 
-The runner executes the original eager loader, independent 96-frame batches,
-and streamSAM with the same source, checkpoint, prompt, dtype, and frame limit.
-It writes raw frame and memory telemetry, subprocess logs, summaries, and a
-synchronized replay under `benchmark_artifacts/demo_comparison/`.
-
-See [`benchmarks/README.md`](benchmarks/README.md) for measurement tools,
-video rendering, and CPU/CUDA contract checks.
-
-To repeat the published workload, use an input with at least 1,000 frames and
-change `--max-frames` to `1000`. The bundled dog clip has 289 frames. The table
-below came from a separate 1,000-frame source, so the repository reproduces the
-benchmark method but does not ship the exact source video needed to reproduce
-the same numbers byte for byte.
-
-One matched local run on an NVIDIA GeForce RTX 5060 Laptop GPU with BF16 and no
-compilation produced:
-
-| Execution strategy | Result | End-to-end FPS | Peak process RSS |
-| --- | ---: | ---: | ---: |
-| Original eager loading | Safety stop before frame 1 | n/a | 4.5 GiB limit |
-| Independent 96-frame batches | 1,000 / 1,000 frames | 17.46 | 4.40 GiB |
-| streamSAM | 1,000 / 1,000 frames | **24.49** | **2.52 GiB** |
-
-The eager run was stopped at the configured host RSS limit before it could
-materialize the complete input tensor. This was a recorded safety stop, not a
-CUDA out-of-memory result. The numbers above describe this one matched run, not
-a cross-hardware performance claim.
-
-The implementation and lower-level profiling notes are in
-[`docs/SAM2_GPU_STREAMING_PIPELINE.md`](docs/SAM2_GPU_STREAMING_PIPELINE.md).
+The [benchmark guide](benchmarks/README.md) has the measured results, workload
+details, and other checks.
 
 ## Attribution
 
