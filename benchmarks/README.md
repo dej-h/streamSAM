@@ -61,9 +61,11 @@ compilation produced:
 
 The eager run was stopped at the configured host RSS limit before it could
 materialize the complete input tensor. This was a recorded safety stop, not a
-CUDA out-of-memory result. The numbers describe this one matched run, not a
-cross-hardware performance claim. The implementation and lower-level profiling
-notes are in [`SAM2_GPU_STREAMING_PIPELINE.md`](../docs/SAM2_GPU_STREAMING_PIPELINE.md).
+CUDA out-of-memory result. It has no comparable throughput result; the FPS
+comparison is between independent batches and streamSAM. The numbers describe
+this one matched run, not a cross-hardware performance claim. The implementation
+and lower-level profiling notes are in
+[`SAM2_GPU_STREAMING_PIPELINE.md`](../docs/SAM2_GPU_STREAMING_PIPELINE.md).
 
 ## Contract checks
 

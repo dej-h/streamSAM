@@ -11,9 +11,10 @@ whole file, bounds decode, CPU queues, resizing, GPU staging, and output writing
 and carries SAM 2 temporal state between frames.
 
 In a 1,000-frame benchmark with EdgeTAM (a SAM 2 variant optimized for on-device
-video segmentation), streamSAM ran faster than independent 96-frame batches
-while using less host memory. The standard eager loader reached the benchmark's
-4.5 GiB memory safety limit before inference started.
+video segmentation), the standard eager loader exhausted the benchmark's
+4.5 GiB RAM budget before inference started, so it has no comparable speed
+result. Of the methods that completed, streamSAM was faster and used less RAM
+than independent 96-frame batches.
 
 The predictor still retains per-frame results, so its state can grow as a video
 gets longer. streamSAM keeps the existing `sam2` API and checkpoint format.
@@ -35,8 +36,10 @@ an asynchronous writer bounds video output.
 
 The repository includes `edgetam.yaml`, an EdgeTAM checkpoint, and example
 videos, so you can try the demo before adding streamSAM to another project.
-Use Python 3.10 or newer and a CUDA-capable machine for the measured streaming
-path. [uv](https://docs.astral.sh/uv/) installs from the committed lockfile:
+Use Python 3.10 or newer and a
+[CUDA-capable NVIDIA GPU](https://developer.nvidia.com/cuda/gpus) for the
+measured streaming path. [uv](https://docs.astral.sh/uv/) installs from the
+committed lockfile:
 
 ```bash
 git clone https://github.com/dej-h/streamSAM.git
@@ -49,13 +52,16 @@ Upload a video or choose an example, mark the object with an include point, then
 click **Track**. The EdgeTAM backbone may download pretrained TIMM weights on
 first use.
 
-If you manage your own Python and PyTorch environment, pip installation also
-works through `pyproject.toml`:
+If you manage your own Python and PyTorch environment, install the package with
+`python3 -m pip install -e .`. To run the bundled demo, install the `gradio`
+extra instead:
 
 ```bash
 python3 -m pip install -e ".[gradio]"
 python3 gradio_app.py
 ```
+
+Pip uses `pyproject.toml` and the retained `setup.py` for the CUDA extension.
 
 ## Run the benchmark
 
