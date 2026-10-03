@@ -8,24 +8,28 @@ https://github.com/user-attachments/assets/887fefa0-2245-440e-8012-15dd3cb26fb5
 
 streamSAM processes finite video files frame by frame. It avoids preloading the
 whole file, bounds decode, CPU queues, resizing, GPU staging, and output writing,
-and carries SAM 2 temporal state between frames. In a matched EdgeTAM benchmark,
-this ran faster and used less host memory than independent frame batches.
+and carries SAM 2 temporal state between frames.
+
+In a 1,000-frame benchmark with EdgeTAM (a SAM 2 variant optimized for on-device
+video segmentation), streamSAM ran faster than independent 96-frame batches
+while using less host memory. The standard eager loader reached the benchmark's
+4.5 GiB memory safety limit before inference started.
 
 The predictor still retains per-frame results, so its state can grow as a video
 gets longer. streamSAM keeps the existing `sam2` API and checkpoint format.
 Existing SAM 2 code can opt into lazy loading with `frame_loading="lazy"`.
 
-The repository is based on Meta's EdgeTAM, which is the benchmarked model. Meta
-SAM 2 tiny and SAM 2.1 tiny also passed a 24-frame compatibility check. Other
-checkpoint sizes have not been tested here.
+streamSAM supports Meta's SAM 2 model family. It has been tested with EdgeTAM,
+Meta SAM 2 tiny, and SAM 2.1 tiny. Other SAM 2 models use the same predictor
+framework and are expected to work, but have not been directly tested.
 
-## What it adds
+## How it is built
 
-- Lazy frame loading with a bounded decode queue and backpressure.
-- Reusable pinned CPU memory and GPU staging slots with explicit ownership.
-- Optional one-frame-ahead image feature production.
-- A predict-then-commit API for changing a mask before it enters temporal memory.
-- Bounded asynchronous video output.
+A lazy frame source feeds a bounded decode queue with backpressure. Frames pass
+through reusable pinned CPU memory and GPU staging slots with explicit ownership.
+Optional one-frame-ahead image feature production overlaps work between frames.
+Predict-then-commit lets a mask be changed before it enters temporal memory, and
+an asynchronous writer bounds video output.
 
 ## Try it locally
 
