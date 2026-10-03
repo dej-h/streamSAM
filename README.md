@@ -1,6 +1,6 @@
 # streamSAM
 
-Bounded video streaming for the SAM2 model family.
+Bounded video-file processing for the SAM 2 model family.
 
 
 
@@ -8,14 +8,15 @@ https://github.com/user-attachments/assets/887fefa0-2245-440e-8012-15dd3cb26fb5
 
 
 
-streamSAM keeps video decode, CPU queues, GPU staging, temporal inference, and
-output writing bounded as a video grows. It retains the existing `sam2` Python
-API and puts the streaming work around the predictor instead of introducing a
-second model API.
+streamSAM processes finite video files without preloading every frame. It
+bounds decode, CPU queues, GPU staging, and output writing while carrying SAM 2
+temporal state across frames. The predictor still retains per-frame results, so
+its state can grow with the video. The existing `sam2` Python API remains in use.
 
-EdgeTAM is the currently verified model. The adapter boundaries are intended to
-support other SAM2-family models, but compatibility with those models has not
-been validated yet.
+EdgeTAM is the benchmarked model. Meta SAM 2 tiny and SAM 2.1 tiny have also
+passed a 24-frame compatibility check; other sizes remain unverified. See the
+[model compatibility report](docs/SAM2_MODEL_COMPATIBILITY.md) and the
+[live-camera/RTSP proposal](docs/LIVE_CAMERA_RTSP_PROPOSAL.md).
 
 ## What it adds
 
