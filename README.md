@@ -1,64 +1,121 @@
 # streamSAM
 
-Bounded video streaming for the SAM2 model family.
+Track longer videos with SAM 2 without loading every frame into memory first.
 
-
+[Quick start](#quick-start) · [Python API](#python-api) ·
+[How it works](#how-it-works) · [Benchmark guide](benchmarks/README.md)
 
 https://github.com/user-attachments/assets/887fefa0-2245-440e-8012-15dd3cb26fb5
 
+## Longer videos, less host memory
 
+streamSAM processes finite video files frame by frame while carrying SAM 2
+temporal state between frames. A 1,000-frame comparison with EdgeTAM:
 
-streamSAM keeps video decode, CPU queues, GPU staging, temporal inference, and
-output writing bounded as a video grows. It retains the existing `sam2` Python
-API and puts the streaming work around the predictor instead of introducing a
-second model API.
+| Execution strategy | End-to-end FPS | Peak process RSS |
+| --- | ---: | ---: |
+| Original eager loading | Stopped before inference | 4.5 GiB safety limit |
+| Independent 96-frame batches | 17.46 | 4.40 GiB |
+| **streamSAM** | **24.49** | **2.52 GiB** |
 
-EdgeTAM is the currently verified model. The adapter boundaries are intended to
-support other SAM2-family models, but compatibility with those models has not
-been validated yet.
+[Benchmark setup and reproduction](benchmarks/README.md#published-comparison).
 
-## What it adds
+Decode, CPU queues, resizing, GPU staging, and output writing are bounded.
+**The predictor still retains per-frame results**, so its state can grow as a
+video gets longer.
 
-- Lazy frame sources with bounded decode queues and backpressure.
-- Reusable pinned-memory and GPU staging slots with explicit CUDA ownership.
-- Optional one-frame-ahead image feature production.
-- A predict-then-commit API for changing a mask before it enters temporal memory.
-- Bounded asynchronous video output, GPU timings, NVTX ranges, and Perfetto traces.
-- Contract checks and matched benchmark tooling for throughput, memory, and mask
-  fidelity.
+## Quick start
 
-## Install
-
-streamSAM requires Python 3.10 or newer, PyTorch 2.3.1 or newer, and a CUDA-capable
-machine for the measured streaming path. Install PyTorch for your CUDA version
-first, then install the repository:
+Use Python 3.10 or newer, PyTorch 2.3.1 or newer, and a
+[CUDA-capable NVIDIA GPU](https://developer.nvidia.com/cuda/gpus) for the measured
+streaming path. The repository includes the EdgeTAM configuration, checkpoint,
+and example videos. [uv](https://docs.astral.sh/uv/) installs from the committed
+lockfile:
 
 ```bash
 git clone https://github.com/dej-h/streamSAM.git
 cd streamSAM
+uv sync --extra gradio
+uv run --extra gradio python3 gradio_app.py
+```
+
+Upload a video or choose an example, mark the object with an include point,
+then click **Track**. The EdgeTAM backbone may download pretrained TIMM weights
+on first use.
+
+<details>
+<summary>Install with pip</summary>
+
+Install PyTorch for your CUDA version first, then install the package:
+
+```bash
 python3 -m pip install -e .
 ```
 
-The repository includes the verified EdgeTAM configuration and checkpoint. The
-EdgeTAM backbone may download its pretrained TIMM weights on first use.
-
-For the local Gradio demo:
+For the Gradio demo, install the optional dependencies and start the app:
 
 ```bash
 python3 -m pip install -e ".[gradio]"
 python3 gradio_app.py
 ```
 
-## Reproduce the benchmark
+Pip uses `pyproject.toml` for package metadata and `setup.py` to build the
+CUDA extension.
 
-Install the locked benchmark environment with
-[uv](https://docs.astral.sh/uv/):
+</details>
 
-```bash
-uv sync --group benchmark
+## Python API
+
+streamSAM keeps the existing `sam2` API and checkpoint format. In an existing
+SAM 2 application, enable lazy loading when initializing the predictor state:
+
+```python
+state = predictor.init_state(
+    video_path="examples/01_dog.mp4",
+    frame_loading="lazy",
+    offload_state_to_cpu=True,
+)
 ```
 
-Run a 200-frame end-to-end comparison with the bundled example:
+Use `add_new_points_or_box` and `propagate_in_video` to prompt and track as
+usual. When finished, call `predictor.close_video_source(state)` to release
+the frame source and staging workers. The [Gradio app](gradio_app.py) shows
+prompt handling and bounded video output together.
+
+EdgeTAM is the currently verified model. The adapter boundaries are intended
+to support other SAM 2-family models, but compatibility with those models has
+not been validated yet.
+
+## How it works
+
+A lazy frame source feeds a bounded decode queue with backpressure. Frames
+pass through reusable pinned CPU memory and GPU staging slots with explicit
+CUDA ownership, then enter ordered temporal inference.
+
+```mermaid
+flowchart LR
+    video[Video file] --> queue[Decode + bounded queue]
+    queue --> staging[Pinned / GPU staging]
+    staging --> inference[SAM 2]
+    inference --> writer[Bounded writer]
+    inference --> memory[Temporal memory]
+    memory --> inference
+```
+
+Optional one-frame-ahead image feature production overlaps work between frames.
+The predict-then-commit API lets an application change a mask before it enters
+temporal memory. An asynchronous writer bounds video output.
+
+The [pipeline guide](docs/SAM2_GPU_STREAMING_PIPELINE.md) explains buffer
+ownership, CUDA streams, compilation, and measured stage timings. GPU timings,
+NVTX ranges, and Perfetto traces support profiling; the
+[benchmark guide](benchmarks/README.md) covers matched throughput, memory, and
+mask-fidelity checks.
+
+## Run the benchmark
+
+The bundled comparison runs eager loading, independent batches, and streamSAM
+on the same source, checkpoint, prompt, dtype, and frame limit:
 
 ```bash
 uv run --group benchmark python3 -m benchmarks.video.run_benchmark_demo \
@@ -69,36 +126,10 @@ uv run --group benchmark python3 -m benchmarks.video.run_benchmark_demo \
   --playback-speed 2
 ```
 
-The runner executes the original eager loader, independent 96-frame batches,
-and streamSAM with the same source, checkpoint, prompt, dtype, and frame limit.
-It writes raw frame and memory telemetry, subprocess logs, summaries, and a
-synchronized replay under `benchmark_artifacts/demo_comparison/`.
-
-See [`benchmarks/README.md`](benchmarks/README.md) for measurement tools,
-video rendering, and CPU/CUDA contract checks.
-
-To repeat the published workload, use an input with at least 1,000 frames and
-change `--max-frames` to `1000`. The bundled dog clip has 289 frames. The table
-below came from a separate 1,000-frame source, so the repository reproduces the
-benchmark method but does not ship the exact source video needed to reproduce
-the same numbers byte for byte.
-
-One matched local run on an NVIDIA GeForce RTX 5060 Laptop GPU with BF16 and no
-compilation produced:
-
-| Execution strategy | Result | End-to-end FPS | Peak process RSS |
-| --- | ---: | ---: | ---: |
-| Original eager loading | Safety stop before frame 1 | n/a | 4.5 GiB limit |
-| Independent 96-frame batches | 1,000 / 1,000 frames | 17.46 | 4.40 GiB |
-| streamSAM | 1,000 / 1,000 frames | **24.49** | **2.52 GiB** |
-
-The eager run was stopped at the configured host RSS limit before it could
-materialize the complete input tensor. This was a recorded safety stop, not a
-CUDA out-of-memory result. The numbers above describe this one matched run, not
-a cross-hardware performance claim.
-
-The implementation and lower-level profiling notes are in
-[`docs/SAM2_GPU_STREAMING_PIPELINE.md`](docs/SAM2_GPU_STREAMING_PIPELINE.md).
+The runner writes raw frame and memory telemetry, subprocess logs, summaries,
+and a synchronized replay under `benchmark_artifacts/demo_comparison/`.
+The [benchmark guide](benchmarks/README.md) covers measurement tools, video
+rendering, and CPU/CUDA contract checks.
 
 ## Attribution
 
@@ -108,10 +139,15 @@ streamSAM is derived from Meta's
 configuration, checkpoint, copyright notices, and Git history remain attributed
 to their original authors.
 
+streamSAM is independently maintained and is not affiliated with or endorsed
+by Meta.
+
+<details>
+<summary>Original authors and research citation</summary>
+
 The original EdgeTAM authors are Chong Zhou, Chenchen Zhu, Yunyang Xiong,
 Saksham Suri, Fanyi Xiao, Lemeng Wu, Raghuraman Krishnamoorthi, Bo Dai,
-Chen Change Loy, Vikas Chandra, and Bilge Soran. streamSAM is independently
-maintained and is not affiliated with or endorsed by Meta.
+Chen Change Loy, Vikas Chandra, and Bilge Soran.
 
 If you use the EdgeTAM model or checkpoint in research, cite the original work:
 
@@ -123,6 +159,8 @@ If you use the EdgeTAM model or checkpoint in research, cite the original work:
   year={2025}
 }
 ```
+
+</details>
 
 ## License
 
