@@ -1,7 +1,9 @@
 # Live camera and RTSP support proposal
 
-Status: proposed. This document describes work to be implemented and verified;
-the current streamSAM API accepts finite video files, not live sources.
+Status: original design proposal. The first live RTSP path is implemented on
+the `rtsp-live-input` branch. See [RTSP live input](RTSP_LIVE_INPUT.md) for its
+actual API, usage, verification, and remaining limits. The longer retention
+and reliability gates below are still proposed work.
 
 ## Goal and boundary
 

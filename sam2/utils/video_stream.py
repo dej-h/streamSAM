@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Condition, Thread
+from threading import Condition, Lock, Thread
 from typing import Literal, Protocol, Sequence, runtime_checkable
 
 import cv2
@@ -42,6 +42,10 @@ class FrameSourceStats:
     wait_count: int
     wait_seconds: float
     closed: bool
+
+
+class LiveResolutionChanged(ValueError):
+    """A camera frame no longer matches the current tracking epoch."""
 
 
 @runtime_checkable
@@ -97,6 +101,99 @@ class EagerFrameSource:
 
     def close(self) -> None:
         self._closed = True
+
+
+class LiveVideoFrameSource:
+    """Expose the current live frame through the existing indexed frame contract.
+
+    Indices count frames accepted for inference, not frames decoded by a camera.
+    Only the current frame is readable. The predictor retains temporal features
+    separately, so earlier image tensors need not stay in this source.
+    """
+
+    def __init__(
+        self,
+        first_bgr_frame: np.ndarray,
+        image_size: int,
+        img_mean: RgbMean = (0.485, 0.456, 0.406),
+        img_std: RgbStd = (0.229, 0.224, 0.225),
+    ) -> None:
+        if image_size <= 0:
+            raise ValueError("image size must be positive")
+        height, width = _bgr_dimensions(first_bgr_frame)
+        self._image_size = image_size
+        self._video_height = height
+        self._video_width = width
+        self._img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        self._img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        self._preprocessing_identity = _preprocessing_identity(
+            image_size, img_mean, img_std
+        )
+        self._lock = Lock()
+        self._current_frame = self._normalize_frame(first_bgr_frame)
+        self._current_index = 0
+        self._closed = False
+
+    @property
+    def metadata(self) -> FrameSourceMetadata:
+        with self._lock:
+            return FrameSourceMetadata(
+                frame_count=self._current_index + 1,
+                video_height=self._video_height,
+                video_width=self._video_width,
+                fps=None,
+                image_size=self._image_size,
+                preprocessing_identity=self._preprocessing_identity,
+            )
+
+    def __len__(self) -> int:
+        with self._lock:
+            return self._current_index + 1
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live frame source is closed")
+            if index != self._current_index:
+                raise IndexError(f"live frame {index} is no longer available")
+            return self._current_frame
+
+    def append_bgr_frame(self, bgr_frame: np.ndarray) -> int:
+        height, width = _bgr_dimensions(bgr_frame)
+        if (height, width) != (self._video_height, self._video_width):
+            raise LiveResolutionChanged(
+                "live video dimensions changed; start a new tracking session"
+            )
+        normalized = self._normalize_frame(bgr_frame)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live frame source is closed")
+            self._current_index += 1
+            self._current_frame = normalized
+            return self._current_index
+
+    def stats(self) -> FrameSourceStats:
+        with self._lock:
+            return FrameSourceStats(
+                capacity=1,
+                current_depth=0 if self._closed else 1,
+                maximum_depth=1,
+                decoded_frames=self._current_index + 1,
+                seek_count=0,
+                wait_count=0,
+                wait_seconds=0.0,
+                closed=self._closed,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._current_frame = torch.empty(0)
+
+    def _normalize_frame(self, bgr_frame: np.ndarray) -> torch.Tensor:
+        return normalize_bgr_frame(
+            bgr_frame, self._image_size, self._img_mean, self._img_std
+        )
 
 
 class SequentialMp4FrameSource:
@@ -277,19 +374,9 @@ class SequentialMp4FrameSource:
             capture.release()
 
     def _normalize_frame(self, bgr_frame: np.ndarray) -> torch.Tensor:
-        resized_bgr = cv2.resize(
-            bgr_frame,
-            (self._image_size, self._image_size),
-            interpolation=cv2.INTER_LINEAR,
+        normalized = normalize_bgr_frame(
+            bgr_frame, self._image_size, self._img_mean, self._img_std
         )
-        rgb_frame = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
-        normalized = (
-            torch.from_numpy(rgb_frame)
-            .permute(2, 0, 1)
-            .to(dtype=torch.float32)
-            .div_(255.0)
-        )
-        normalized.sub_(self._img_mean).div_(self._img_std)
         return normalized.pin_memory() if self._pin_memory else normalized
 
     def _open_capture(self) -> cv2.VideoCapture:
@@ -624,3 +711,31 @@ def _preprocessing_identity(
     image_size: int, img_mean: RgbMean, img_std: RgbStd
 ) -> str:
     return f"opencv-rgb-square-{image_size}:mean={img_mean}:std={img_std}"
+
+
+def _bgr_dimensions(bgr_frame: np.ndarray) -> tuple[int, int]:
+    if bgr_frame.ndim != 3 or bgr_frame.shape[2] != 3 or bgr_frame.dtype != np.uint8:
+        raise ValueError("a live frame must be a uint8 BGR image with three channels")
+    height, width = bgr_frame.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("a live frame must have positive dimensions")
+    return height, width
+
+
+def normalize_bgr_frame(
+    bgr_frame: np.ndarray,
+    image_size: int,
+    img_mean: torch.Tensor,
+    img_std: torch.Tensor,
+) -> torch.Tensor:
+    """Match the MP4 path's resize, RGB conversion, and ImageNet normalization."""
+    _bgr_dimensions(bgr_frame)
+    resized_bgr = cv2.resize(
+        bgr_frame, (image_size, image_size), interpolation=cv2.INTER_LINEAR
+    )
+    rgb_frame = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+    normalized = (
+        torch.from_numpy(rgb_frame).permute(2, 0, 1).to(dtype=torch.float32).div_(255.0)
+    )
+    normalized.sub_(img_mean).div_(img_std)
+    return normalized

@@ -91,3 +91,21 @@ uv run --group benchmark python3 -m benchmarks.tests.gpu_image_feature_pipeline_
 The CUDA checks use decoded frames and synthetic feature operations; they do not
 require a model checkpoint. Use a video with at least eight frames for the CPU
 frame-source check.
+
+## Live RTSP checks
+
+The reader check uses a prerecorded file as its decoder fixture. The live
+predictor check needs CUDA and the bundled EdgeTAM checkpoint. It compares
+one-frame-at-a-time input with finite-video masks and checks state retention:
+
+```bash
+uv run --group benchmark python3 -m benchmarks.tests.rtsp_reader_contract_checks \
+  --video examples/01_dog.mp4
+uv run --group benchmark python3 -m benchmarks.tests.live_video_contract_checks \
+  --video examples/01_dog.mp4 --frame-count 200
+uv run --group benchmark python3 -m benchmarks.tests.live_video_contract_checks \
+  --video examples/01_dog.mp4 --frame-count 48 --memory-stride 4
+```
+
+The [RTSP live input guide](../docs/RTSP_LIVE_INPUT.md) has the camera example
+and current scope.
