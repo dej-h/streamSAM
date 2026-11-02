@@ -51,8 +51,7 @@ below came from a separate 1,000-frame source, so the repository reproduces the
 benchmark method but does not ship the exact source video needed to reproduce
 the same numbers byte for byte.
 
-One matched local run on an NVIDIA GeForce RTX 5060 Laptop GPU with BF16 and no
-compilation produced:
+Benchmark setup: NVIDIA GeForce RTX 5060 Laptop GPU, BF16, no compilation.
 
 | Execution strategy | Result | End-to-end FPS | Peak process RSS |
 | --- | ---: | ---: | ---: |
@@ -62,8 +61,7 @@ compilation produced:
 
 The eager run was stopped at the configured host RSS limit before it could
 materialize the complete input tensor. This was a recorded safety stop, not a
-CUDA out-of-memory result. The numbers above describe this one matched run, not
-a cross-hardware performance claim.
+CUDA out-of-memory result.
 
 The implementation and lower-level profiling notes are in
 [`SAM2_GPU_STREAMING_PIPELINE.md`](../docs/SAM2_GPU_STREAMING_PIPELINE.md).

@@ -10,8 +10,7 @@ https://github.com/user-attachments/assets/887fefa0-2245-440e-8012-15dd3cb26fb5
 ## Longer videos, less host memory
 
 streamSAM processes finite video files frame by frame while carrying SAM 2
-temporal state between frames. In one matched 1,000-frame run with EdgeTAM,
-it completed the video at **24.49 FPS** with **2.52 GiB peak host RAM**:
+temporal state between frames. A 1,000-frame comparison with EdgeTAM:
 
 | Execution strategy | End-to-end FPS | Peak process RSS |
 | --- | ---: | ---: |
@@ -19,12 +18,7 @@ it completed the video at **24.49 FPS** with **2.52 GiB peak host RAM**:
 | Independent 96-frame batches | 17.46 | 4.40 GiB |
 | **streamSAM** | **24.49** | **2.52 GiB** |
 
-Measured on an NVIDIA GeForce RTX 5060 Laptop GPU, BF16, without compilation.
-The eager loader reached the configured host RAM limit before frame 1; it has
-no comparable speed result. The throughput comparison is between independent
-batches and streamSAM, and describes this one run rather than performance
-across hardware. See the [benchmark guide](benchmarks/README.md#published-comparison)
-for workload details and reproduction limits.
+[Benchmark setup and reproduction](benchmarks/README.md#published-comparison).
 
 Decode, CPU queues, resizing, GPU staging, and output writing are bounded.
 **The predictor still retains per-frame results**, so its state can grow as a
