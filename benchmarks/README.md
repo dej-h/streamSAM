@@ -90,3 +90,16 @@ uv run --group benchmark python3 -m benchmarks.tests.gpu_image_feature_pipeline_
 The CUDA checks use decoded frames and synthetic feature operations; they do not
 require a model checkpoint. Use a video with at least eight frames for the CPU
 frame-source check.
+
+## Live frame checks
+
+The live predictor check feeds decoded frames to `LiveVideoSession` one at a time.
+It uses CUDA and the bundled EdgeTAM checkpoint to compare masks with the
+finite-video path and check temporal-state retention at two memory strides.
+
+```bash
+uv run --group benchmark python3 -m benchmarks.tests.live_video_contract_checks \
+  --video examples/01_dog.mp4 --frame-count 200
+uv run --group benchmark python3 -m benchmarks.tests.live_video_contract_checks \
+  --video examples/01_dog.mp4 --frame-count 48 --memory-stride 4
+```
