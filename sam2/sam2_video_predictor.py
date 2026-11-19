@@ -27,6 +27,7 @@ from sam2.utils.misc import concat_points, fill_holes_in_mask_scores
 from sam2.utils.video_stream import (
     FrameLoadingMode,
     FrameSource,
+    LiveVideoFrameSource,
     create_video_frame_source,
 )
 
@@ -132,6 +133,56 @@ class SAM2VideoPredictor(SAM2Base):
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
         )
+        return self._init_state_from_source(
+            frame_source,
+            offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
+            frame_loading=frame_loading,
+            enable_gpu_frame_staging=enable_gpu_frame_staging,
+            gpu_frame_staging_slots=gpu_frame_staging_slots,
+            enable_concurrent_image_encoder=enable_concurrent_image_encoder,
+            gpu_stage_profiler=gpu_stage_profiler,
+        )
+
+    @torch.inference_mode()
+    def init_live_state(
+        self,
+        frame_source: LiveVideoFrameSource,
+        *,
+        offload_state_to_cpu: bool = True,
+        enable_gpu_frame_staging: bool = True,
+        gpu_frame_staging_slots: int = DEFAULT_GPU_STAGING_SLOT_COUNT,
+    ):
+        """Initialize the existing SAM 2 state around an arriving-frame source.
+
+        The caller appends one frame before each single-frame propagation and
+        updates ``num_frames`` to the number accepted so far. The fixed-length
+        image feature pipeline is disabled for this source.
+        """
+        return self._init_state_from_source(
+            frame_source,
+            offload_video_to_cpu=True,
+            offload_state_to_cpu=offload_state_to_cpu,
+            frame_loading="lazy",
+            enable_gpu_frame_staging=enable_gpu_frame_staging,
+            gpu_frame_staging_slots=gpu_frame_staging_slots,
+            enable_concurrent_image_encoder=False,
+            gpu_stage_profiler=None,
+        )
+
+    def _init_state_from_source(
+        self,
+        frame_source: FrameSource,
+        *,
+        offload_video_to_cpu: bool,
+        offload_state_to_cpu: bool,
+        frame_loading: FrameLoadingMode,
+        enable_gpu_frame_staging: bool,
+        gpu_frame_staging_slots: int,
+        enable_concurrent_image_encoder: bool,
+        gpu_stage_profiler: GpuStageProfiler | None,
+    ):
+        compute_device = self.device
         inference_state = {}
         inference_state["images"] = frame_source
         inference_state["frame_source"] = frame_source
@@ -222,7 +273,11 @@ class SAM2VideoPredictor(SAM2Base):
             else 0
         )
         # Warm up the visual backbone and cache the image feature on frame 0
-        self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        try:
+            self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        except BaseException:
+            self.close_video_source(inference_state)
+            raise
         return inference_state
 
     def close_video_source(self, inference_state) -> None:
@@ -824,6 +879,7 @@ class SAM2VideoPredictor(SAM2Base):
         start_frame_idx: int | None = None,
         max_frame_num_to_track: int | None = None,
         reverse: bool = False,
+        show_progress: bool = True,
     ) -> Generator[VideoFramePrediction, None, None]:
         """Yield each mask before it is committed to temporal memory.
 
@@ -867,7 +923,9 @@ class SAM2VideoPredictor(SAM2Base):
             )
             processing_order = range(start_frame_idx, end_frame_idx + 1)
 
-        for frame_idx in tqdm(processing_order, desc="propagate in video"):
+        for frame_idx in tqdm(
+            processing_order, desc="propagate in video", disable=not show_progress
+        ):
             # We skip those frames already in consolidated outputs (these are frames
             # that received input clicks or mask). Note that we cannot directly run
             # batched forward on them via `_run_single_frame_inference` because the
