@@ -103,3 +103,25 @@ uv run --group benchmark python3 -m benchmarks.tests.live_video_contract_checks 
 uv run --group benchmark python3 -m benchmarks.tests.live_video_contract_checks \
   --video examples/01_dog.mp4 --frame-count 48 --memory-stride 4
 ```
+
+## RTSP reader and reconnect checks
+
+The reader check uses a prerecorded file as its decoder fixture to exercise queue
+bounds, frame drops and timeout defaults. The
+[RTSP live input guide](../docs/RTSP_LIVE_INPUT.md) has the camera example and
+current scope.
+
+```bash
+uv run --group benchmark python3 -m benchmarks.tests.rtsp_reader_contract_checks \
+  --video examples/01_dog.mp4
+```
+
+The CPU mask-prompt checks cover holes, concavities, disconnected regions,
+one-pixel-wide fragments, image boundaries, and point budgets. The CUDA
+reconnect check tracks a translated object, then compares mask-derived points
+with the original click after starting a fresh session.
+
+```bash
+uv run python3 -m benchmarks.tests.mask_prompt_contract_checks
+uv run python3 -m benchmarks.tests.live_reconnect_contract_checks
+```
