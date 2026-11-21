@@ -40,8 +40,15 @@ class H264VideoEncoder:
         # YUV 4:2:0 needs even dimensions. Keep all source pixels by padding.
         if width % 2 or height % 2:
             command.extend(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+        # Limit encoder buffering while inference and decode share the host.
         command.extend(
-            ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mp4", str(output_path)]
+            [
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-f", "mp4",
+                "-threads", "4",
+                str(output_path),
+            ]
         )
 
         # FFmpeg can write diagnostics without blocking the frame pipe.
