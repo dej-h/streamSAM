@@ -142,6 +142,8 @@ class LiveVideoFrameSource:
                 f"native-yuv-rgb-square-{image_size}:mean={img_mean}:std={img_std}"
             )
         self._lock = Lock()
+        self._native_cuda_frame: VideoFrame | None = None
+        self._input_reads_complete = torch.cuda.Event() if self.device.type == "cuda" else None
         self._current_frame = self._normalize_frame(first_bgr_frame)
         self._current_index = 0
         self._closed = False
@@ -183,12 +185,11 @@ class LiveVideoFrameSource:
             raise LiveFrameDeviceChanged(
                 "live video frame device changed; start a new tracking session"
             )
-        normalized = self._normalize_frame(pixels)
         with self._lock:
             if self._closed:
                 raise RuntimeError("live frame source is closed")
+            self._current_frame = self._normalize_frame(pixels)
             self._current_index += 1
-            self._current_frame = normalized
             return self._current_index
 
     def stats(self) -> FrameSourceStats:
@@ -206,6 +207,9 @@ class LiveVideoFrameSource:
 
     def close(self) -> None:
         with self._lock:
+            if self._native_cuda_frame is not None and self._input_reads_complete is not None:
+                self._input_reads_complete.synchronize()
+                self._native_cuda_frame = None
             self._closed = True
             self._current_frame = torch.empty(0)
 
@@ -223,9 +227,15 @@ class LiveVideoFrameSource:
 
     def _normalize_frame(self, pixels: NDArray[np.uint8] | VideoFrame) -> torch.Tensor:
         if isinstance(pixels, VideoFrame):
-            return normalize_video_frame(
-                pixels, self._image_size, self._img_mean, self._img_std
+            normalized = normalize_video_frame(
+                pixels, self._image_size, self._img_mean, self._img_std,
+                input_reads_complete=self._input_reads_complete,
             )
+            if self._input_reads_complete is not None:
+                # The producer-readiness barrier in normalize_video_frame also
+                # completes prior surface reads before we replace their owner.
+                self._native_cuda_frame = pixels
+            return normalized
         return _normalize_bgr_frame(
             pixels, self._image_size, self._img_mean, self._img_std
         )

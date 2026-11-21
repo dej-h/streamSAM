@@ -112,10 +112,15 @@ input, both devices resize the luma and chroma planes with bilinear half-pixel
 sampling, apply the supported declared color matrix and range, and round to
 8-bit RGB before normalizing. Unspecified color uses BT.601 and limited YUV range
 unless the pixel format indicates full range. CUDA NV12 and P010 frames stay on
-the GPU from decode through inference. Other layouts may require software
-preprocessing. Call `frame.bgr` to obtain a CPU image when an application
-needs the source pixels for rendering. Direct BGR callers and finite MP4
-input use their existing RGB resize and normalization path.
+the GPU from decode through inference. On supported Triton installations, a
+single CUDA kernel reads the pitched planes and writes the normalized model
+tensor. When that kernel is unavailable, the same conversion runs using
+PyTorch operations on the GPU. Other layouts may require software
+preprocessing. PyAV's DLPack export requires synchronization before reading a
+CUDA surface. The live frame source also holds the most recent surface until
+its preprocessing reads complete. Call `frame.bgr` to obtain a CPU image when
+an application needs the source pixels for rendering. Direct BGR callers and
+finite MP4 input use their existing RGB resize and normalization path.
 
 The source exposes only the latest accepted frame through the predictor's
 indexed source interface. The session assigns a contiguous processed index
