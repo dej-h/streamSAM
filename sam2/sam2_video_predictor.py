@@ -161,10 +161,10 @@ class SAM2VideoPredictor(SAM2Base):
         """
         return self._init_state_from_source(
             frame_source,
-            offload_video_to_cpu=True,
+            offload_video_to_cpu=frame_source.device.type == "cpu",
             offload_state_to_cpu=offload_state_to_cpu,
             frame_loading="lazy",
-            enable_gpu_frame_staging=enable_gpu_frame_staging,
+            enable_gpu_frame_staging=enable_gpu_frame_staging and frame_source.device.type == "cpu",
             gpu_frame_staging_slots=gpu_frame_staging_slots,
             enable_concurrent_image_encoder=False,
             gpu_stage_profiler=None,

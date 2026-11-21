@@ -9,12 +9,14 @@ from pathlib import Path
 from threading import Condition, Lock, Thread
 from typing import Literal, Protocol, Sequence, runtime_checkable
 
+from av import VideoFrame
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 import torch
 
 from sam2.utils.misc import _load_img_as_tensor, load_video_frames
+from sam2.utils.video_preprocessing import normalize_video_frame, video_frame_device
 
 
 VideoInput = str | bytes
@@ -43,6 +45,10 @@ class FrameSourceStats:
     wait_count: int
     wait_seconds: float
     closed: bool
+
+
+class LiveFrameDeviceChanged(ValueError):
+    """A frame changed from host to device memory, or the reverse."""
 
 
 class LiveResolutionChanged(ValueError):
@@ -114,22 +120,27 @@ class LiveVideoFrameSource:
 
     def __init__(
         self,
-        first_bgr_frame: NDArray[np.uint8],
+        first_bgr_frame: NDArray[np.uint8] | VideoFrame,
         image_size: int,
         img_mean: RgbMean = (0.485, 0.456, 0.406),
         img_std: RgbStd = (0.229, 0.224, 0.225),
     ) -> None:
         if image_size <= 0:
             raise ValueError("image size must be positive")
-        height, width = _bgr_dimensions(first_bgr_frame)
+        height, width = self._dimensions(first_bgr_frame)
         self._image_size = image_size
         self._video_height = height
         self._video_width = width
-        self._img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
-        self._img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        self.device = self._device(first_bgr_frame)
+        self._img_mean = torch.tensor(img_mean, device=self.device, dtype=torch.float32)[:, None, None]
+        self._img_std = torch.tensor(img_std, device=self.device, dtype=torch.float32)[:, None, None]
         self._preprocessing_identity = _preprocessing_identity(
             image_size, img_mean, img_std
         )
+        if isinstance(first_bgr_frame, VideoFrame):
+            self._preprocessing_identity = (
+                f"native-yuv-rgb-square-{image_size}:mean={img_mean}:std={img_std}"
+            )
         self._lock = Lock()
         self._current_frame = self._normalize_frame(first_bgr_frame)
         self._current_index = 0
@@ -160,12 +171,19 @@ class LiveVideoFrameSource:
             return self._current_frame
 
     def append_bgr_frame(self, bgr_frame: NDArray[np.uint8]) -> int:
-        height, width = _bgr_dimensions(bgr_frame)
+        return self.append_frame(bgr_frame)
+
+    def append_frame(self, pixels: NDArray[np.uint8] | VideoFrame) -> int:
+        height, width = self._dimensions(pixels)
         if (height, width) != (self._video_height, self._video_width):
             raise LiveResolutionChanged(
                 "live video dimensions changed; start a new tracking session"
             )
-        normalized = self._normalize_frame(bgr_frame)
+        if self._device(pixels) != self.device:
+            raise LiveFrameDeviceChanged(
+                "live video frame device changed; start a new tracking session"
+            )
+        normalized = self._normalize_frame(pixels)
         with self._lock:
             if self._closed:
                 raise RuntimeError("live frame source is closed")
@@ -191,9 +209,25 @@ class LiveVideoFrameSource:
             self._closed = True
             self._current_frame = torch.empty(0)
 
-    def _normalize_frame(self, bgr_frame: np.ndarray) -> torch.Tensor:
+    @staticmethod
+    def _dimensions(pixels: NDArray[np.uint8] | VideoFrame) -> tuple[int, int]:
+        if isinstance(pixels, VideoFrame):
+            return pixels.height, pixels.width
+        return _bgr_dimensions(pixels)
+
+    @staticmethod
+    def _device(pixels: NDArray[np.uint8] | VideoFrame) -> torch.device:
+        if isinstance(pixels, VideoFrame):
+            return video_frame_device(pixels)
+        return torch.device("cpu")
+
+    def _normalize_frame(self, pixels: NDArray[np.uint8] | VideoFrame) -> torch.Tensor:
+        if isinstance(pixels, VideoFrame):
+            return normalize_video_frame(
+                pixels, self._image_size, self._img_mean, self._img_std
+            )
         return _normalize_bgr_frame(
-            bgr_frame, self._image_size, self._img_mean, self._img_std
+            pixels, self._image_size, self._img_mean, self._img_std
         )
 
 

@@ -9,7 +9,8 @@ from typing import TypedDict, cast
 
 import numpy as np
 from numpy.typing import NDArray
-from sam2.live_frame import CapturedFrame
+import torch
+from sam2.live_frame import LiveFrame
 from sam2.sam2_video_predictor import FrameOutput, SAM2VideoPredictor
 from sam2.utils.video_stream import LiveVideoFrameSource
 
@@ -24,6 +25,8 @@ class _LiveInferenceState(TypedDict):
     output_dict: _StoredOutputs
     output_dict_per_obj: dict[int, _StoredOutputs]
     frames_already_tracked: dict[int, object]
+    cached_features: dict[int, object]
+    constants: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -48,14 +51,14 @@ class LiveVideoSession:
     def __init__(
         self,
         predictor: SAM2VideoPredictor,
-        first_frame: CapturedFrame,
+        first_frame: LiveFrame,
         *,
         offload_state_to_cpu: bool = True,
         enable_gpu_frame_staging: bool = True,
     ) -> None:
         self._predictor = predictor
         self._frame_source = LiveVideoFrameSource(
-            first_frame.bgr, image_size=predictor.image_size
+            first_frame.pixels, image_size=predictor.image_size
         )
         # The predictor stores inference state in a heterogeneous dictionary.
         # The live session types describe the fields it reads and updates.
@@ -70,9 +73,8 @@ class LiveVideoSession:
             self._frame_source.close()
             raise
         self._state = cast(_LiveInferenceState, state)
-        self._current_frame = first_frame
+        self._current_frame: LiveFrame | None = first_frame
         self._prompted = False
-        self._closed = False
         self._failed = False
 
     def prompt_point(self, x: float, y: float, *, obj_id: int = 1) -> LiveMaskResult:
@@ -93,14 +95,14 @@ class LiveVideoSession:
         context to avoid overwhelming the sparse prompt decoder. The mask is
         a decoder hint; it does not restore temporal state from another session.
         """
-        self._require_unprompted()
+        frame = self._require_unprompted()
         points = np.asarray(points, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 2 or not len(points):
             raise ValueError("points must have shape (N, 2) with at least one point")
         if not np.isfinite(points).all():
             raise ValueError("points must contain finite coordinates")
         if mask is not None and (
-            mask.dtype != np.bool_ or mask.shape != self._current_frame.bgr.shape[:2]
+            mask.dtype != np.bool_ or mask.shape != frame.dimensions
         ):
             raise ValueError(
                 "mask must be boolean and match the first frame dimensions"
@@ -123,13 +125,13 @@ class LiveVideoSession:
         except BaseException:
             self._failed = True
             raise
-        return self._commit_current()
+        return self._commit_current(frame)
 
     def prompt_box(
         self, box: tuple[float, float, float, float], *, obj_id: int = 1
     ) -> LiveMaskResult:
         """Prompt the first frame with an (x0, y0, x1, y1) box."""
-        self._require_unprompted()
+        frame = self._require_unprompted()
         try:
             self._predictor.add_new_points_or_box(
                 inference_state=self._state,
@@ -140,19 +142,19 @@ class LiveVideoSession:
         except BaseException:
             self._failed = True
             raise
-        return self._commit_current()
+        return self._commit_current(frame)
 
-    def track(self, frame: CapturedFrame) -> LiveMaskResult:
+    def track(self, frame: LiveFrame) -> LiveMaskResult:
         """Track the next received frame, preserving the previous SAM 2 memory."""
-        self._require_open()
+        previous = self._require_open()
         if not self._prompted:
             raise RuntimeError("prompt the first live frame before tracking")
-        if frame.decoded_sequence <= self._current_frame.decoded_sequence:
+        if frame.decoded_sequence <= previous.decoded_sequence:
             raise ValueError("decoded frame sequence must increase")
-        frame_idx = self._frame_source.append_bgr_frame(frame.bgr)
+        frame_idx = self._frame_source.append_frame(frame.pixels)
         self._state["num_frames"] = frame_idx + 1
         self._current_frame = frame
-        return self._commit_current()
+        return self._commit_current(frame)
 
     @property
     def retained_output_count(self) -> int:
@@ -162,13 +164,23 @@ class LiveVideoSession:
         )
 
     def close(self) -> None:
-        if self._closed:
+        if self._current_frame is None:
             return
-        self._closed = True
+        frame = self._current_frame
+        self._current_frame = None
         try:
-            self._predictor.close_video_source(self._state)
+            # GPU work may still read the decoder surface if the caller closes
+            # before receiving the first mask. The local frame holds that surface.
+            if self._frame_source.device.type == "cuda":
+                torch.cuda.current_stream(self._frame_source.device).synchronize()
         finally:
-            self._predictor.reset_state(self._state)
+            del frame
+            try:
+                self._predictor.close_video_source(self._state)
+            finally:
+                self._predictor.reset_state(self._state)
+                self._state["cached_features"].clear()
+                self._state["constants"].clear()
 
     def __enter__(self) -> LiveVideoSession:
         return self
@@ -181,7 +193,7 @@ class LiveVideoSession:
     ) -> None:
         self.close()
 
-    def _commit_current(self) -> LiveMaskResult:
+    def _commit_current(self, frame: LiveFrame) -> LiveMaskResult:
         frame_idx = self._state["num_frames"] - 1
         predictions = self._predictor.propagate_in_video_predictions(
             self._state,
@@ -202,10 +214,9 @@ class LiveVideoSession:
         masks = (committed.mask_logits > 0).squeeze(1).to(device="cpu").numpy().copy()
         return LiveMaskResult(
             processed_index=frame_idx,
-            decoded_sequence=self._current_frame.decoded_sequence,
-            presentation_time_seconds=self._current_frame.presentation_time_seconds,
-            receive_to_mask_seconds=time.monotonic()
-            - self._current_frame.received_at_monotonic,
+            decoded_sequence=frame.decoded_sequence,
+            presentation_time_seconds=frame.presentation_time_seconds,
+            receive_to_mask_seconds=time.monotonic() - frame.received_at_monotonic,
             object_ids=committed.object_ids,
             masks=masks,
         )
@@ -235,13 +246,16 @@ class LiveVideoSession:
                 object_outputs["non_cond_frame_outputs"].pop(old_index, None)
             tracked.pop(old_index, None)
 
-    def _require_open(self) -> None:
-        if self._closed:
+    def _require_open(self) -> LiveFrame:
+        frame = self._current_frame
+        if frame is None:
             raise RuntimeError("live video session is closed")
         if self._failed:
             raise RuntimeError("live video session failed; start a new session")
+        return frame
 
-    def _require_unprompted(self) -> None:
-        self._require_open()
+    def _require_unprompted(self) -> LiveFrame:
+        frame = self._require_open()
         if self._prompted:
             raise RuntimeError("live video session already has its initial prompt")
+        return frame

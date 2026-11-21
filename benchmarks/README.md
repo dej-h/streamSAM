@@ -116,6 +116,15 @@ uv run --group benchmark python3 -m benchmarks.tests.rtsp_reader_contract_checks
   --video examples/01_dog.mp4
 ```
 
+The decoder contract check verifies the software fallback and color range.
+With `--require-cuda`, it also compares the model input from PyAV software
+decode and automatic CUDA decode at matching presentation timestamps.
+
+```bash
+uv run python3 -m benchmarks.tests.rtsp_decoder_contract_checks \
+  --video examples/01_dog.mp4 --require-cuda
+```
+
 The CPU mask-prompt checks cover holes, concavities, disconnected regions,
 one-pixel-wide fragments, image boundaries, and point budgets. The CUDA
 reconnect check tracks a translated object, then compares mask-derived points

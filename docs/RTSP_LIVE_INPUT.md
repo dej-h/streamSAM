@@ -48,17 +48,30 @@ motion during the gap or independently identify an object at a new location.
 After processing starts, reconnect requires a previous foreground mask.
 Connection failures before the first processed frame retry the initial prompt.
 
-The example and `RtspFrameReader` use OpenCV's connection-open and decoder-read
-timeouts. No timeout parameters are passed to the backend unless explicitly
-requested with `--open-timeout-seconds` or `--read-timeout-seconds`. An override
-must fit in positive OpenCV milliseconds. OpenCV
-4.10's FFmpeg backend defaults both to
-[30 seconds](https://github.com/opencv/opencv/blob/4.10.0/modules/videoio/src/cap_ffmpeg_impl.hpp#L242-L243).
-`reader.read()` waits for a frame or for the decoder to stop; applications can
-set a separate caller deadline with `reader.read(timeout_seconds=...)`.
-Closing the reader waits for an in-progress decoder operation to finish under
-the backend's timeout policy. Streams with long keyframe intervals may need a
-larger timeout when joining between keyframes.
+The example and `RtspFrameReader` use PyAV's FFmpeg backend. They preserve
+[OpenCV 4.10's 30-second connection-open and decode-read defaults](https://github.com/opencv/opencv/blob/4.10.0/modules/videoio/src/cap_ffmpeg_impl.hpp#L242-L243).
+Set `--open-timeout-seconds` or `--read-timeout-seconds` to override either
+deadline. `reader.read()` waits for a frame or for the decoder to stop.
+Applications can set a separate caller deadline with
+`reader.read(timeout_seconds=...)`. Closing the reader waits for an in-progress
+decoder operation to finish under the backend's timeout policy. Streams
+with long keyframe intervals may need a larger timeout when joining between
+keyframes.
+
+### Decoder selection
+
+`--decoder auto` is the default. It requests CUDA decoding and GPU-resident
+frames on the model's CUDA device when the installed PyAV supports frame
+sharing and FFmpeg exposes CUDA. FFmpeg can use software decoding when the
+codec or device cannot provide hardware frames. Disconnects and decoder
+timeouts end the current epoch and retry the same selection on reconnect.
+The JSON telemetry reports the actual decoder and any fallback reason.
+
+`--decoder cuda` requires GPU-resident decode and preprocessing.
+`--decoder cpu` uses software decode while the example continues to run
+inference on CUDA. CUDA frame sharing is supported by the locked PyAV versions
+when their FFmpeg build supports NVIDIA decoding. PyAV 17 can share 8-bit NV12
+frames. PyAV 18 or later exposes layout metadata for native 10-bit input.
 
 For an application that supplies its own prompt or mask consumer, pass frames
 from the RTSP reader to the live session.
@@ -67,7 +80,7 @@ from the RTSP reader to the live session.
 from sam2.live_video_session import LiveVideoSession
 from sam2.utils.rtsp_stream import RtspFrameReader
 
-with RtspFrameReader(camera_url) as reader:
+with RtspFrameReader(camera_url, inference_device=predictor.device) as reader:
     first = reader.read()
     with LiveVideoSession(predictor, first) as session:
         result = session.prompt_point(480, 270)
@@ -88,26 +101,33 @@ example script.
 
 ## How frames move
 
-`RtspFrameReader` decodes on a background thread through OpenCV's FFmpeg
-backend. It keeps at most four decoded BGR frames by default. Each `read()`
-returns the newest frame and drops older queued frames, so a slow predictor
-does not build an ever-growing input delay. `RtspReaderStats` exposes decoded
-and locally dropped frame counts and maximum queue depth. It cannot count
-camera-side or network losses.
+`RtspFrameReader` decodes on a background thread through PyAV. It keeps at most
+four decoded frames by default. Each `read()` returns the newest frame and drops
+older queued frames, so a slow predictor does not build an ever-growing input
+delay. `RtspReaderStats` exposes decoded and locally dropped frame counts and
+maximum queue depth. It cannot count camera-side or network losses.
 
-`LiveVideoFrameSource` applies the same resize, RGB conversion, and
-normalization as finite MP4 input. It exposes only the latest accepted frame
-through the predictor's indexed source interface. The session assigns a
-contiguous processed index even when decoded frames are dropped. After each
-commit, it keeps the initial conditioning output and the recent outputs that
-SAM 2 memory attention or object pointers can still use. It removes older
-non-conditioning outputs and their per-object views and tracking metadata.
+`LiveVideoFrameSource` preprocesses only the accepted frame. For native YUV
+input, both devices resize the luma and chroma planes with bilinear half-pixel
+sampling, apply the supported declared color matrix and range, and round to
+8-bit RGB before normalizing. Unspecified color uses BT.601 and limited YUV range
+unless the pixel format indicates full range. CUDA NV12 and P010 frames stay on
+the GPU from decode through inference. Other layouts may require software
+preprocessing. Call `frame.bgr` to obtain a CPU image when an application
+needs the source pixels for rendering. Direct BGR callers and finite MP4
+input use their existing RGB resize and normalization path.
+
+The source exposes only the latest accepted frame through the predictor's
+indexed source interface. The session assigns a contiguous processed index
+even when decoded frames are dropped. After each commit, it keeps the initial
+conditioning output and the recent outputs that SAM 2 memory attention or
+object pointers can still use. It removes older non-conditioning outputs and
+their per-object views and tracking metadata.
 
 `LiveMaskResult` contains CPU boolean masks, processed index, decoded sequence,
-source presentation time when OpenCV exposes it, and time from local frame
-receipt to mask delivery. The tested OpenCV 4.10 build does not expose
-`CAP_PROP_PTS`, so presentation time is `None` with that build. The latency
-value excludes camera capture and network transport.
+source presentation time when available, and time from local frame receipt
+to mask delivery. The latency value excludes camera capture, network transport,
+and buffering before the decoder returns a frame.
 
 ## Current scope and checks
 
@@ -117,9 +137,9 @@ a mask estimate. It emits mask arrays or optional PNG files;
 it does not publish a segmented RTSP stream. Live sessions are forward-only.
 Adding objects later, corrections to earlier frames, and state transfer across
 camera gaps are outside this first path. The finite-video API still handles
-seeking and reverse propagation. The resolution check uses the decoded array
-dimensions. Some OpenCV/FFmpeg builds keep returning the initial array size
-after a native resolution change. Use fixed-resolution feeds with those builds.
+seeking and reverse propagation. The session checks the dimensions exposed by
+the decoder on each accepted frame and starts a new epoch on a change.
+Fixed-resolution feeds are the supported camera setup.
 
 The contract checks compare 200 live-fed EdgeTAM masks with finite-video masks
 in FP32, with exact equality. Retained outputs stayed at 16. A 48-frame replay

@@ -19,7 +19,7 @@ from sam2.build_sam import build_sam2_video_predictor
 from sam2.live_video_session import LiveMaskResult, LiveVideoSession
 from sam2.utils.mask_prompts import sample_mask_interior_points
 from sam2.utils.rtsp_stream import RtspDisconnected, RtspFrameReader, RtspReaderStats
-from sam2.utils.video_stream import LiveResolutionChanged
+from sam2.utils.video_stream import LiveFrameDeviceChanged, LiveResolutionChanged
 
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -36,14 +36,18 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mask-directory", type=Path)
     parser.add_argument("--queue-capacity", type=int, default=4)
     parser.add_argument(
+        "--decoder", choices=("auto", "cuda", "cpu"), default="auto",
+        help="Prefer CUDA automatically, require CUDA, or use software decoding",
+    )
+    parser.add_argument(
         "--open-timeout-seconds",
         type=float,
-        help="Override the OpenCV connection-open timeout in seconds",
+        help="Override the connection-open timeout in seconds",
     )
     parser.add_argument(
         "--read-timeout-seconds",
         type=float,
-        help="Override the OpenCV decoder-read timeout in seconds",
+        help="Override the decoder-read timeout in seconds",
     )
     parser.add_argument("--reconnect-attempts", type=int, default=0)
     parser.add_argument(
@@ -86,6 +90,8 @@ def report_frame(
                 "presentation_time_seconds": result.presentation_time_seconds,
                 "receive_to_mask_ms": round(result.receive_to_mask_seconds * 1000, 1),
                 "foreground_pixels": int(result.masks[0].sum()),
+                "decoder_backend": reader_stats.decoder_backend,
+                "decoder_fallback_reason": reader_stats.fallback_reason,
                 "reader_decoded_frames": reader_stats.decoded_frames,
                 "reader_dropped_frames": reader_stats.dropped_frames,
                 "retained_outputs": retained_outputs,
@@ -113,6 +119,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 with RtspFrameReader(
                     arguments.url,
                     capacity=arguments.queue_capacity,
+                    decoder=arguments.decoder,
+                    inference_device=predictor.device,
                     open_timeout_seconds=arguments.open_timeout_seconds,
                     read_timeout_seconds=arguments.read_timeout_seconds,
                 ) as reader:
@@ -125,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 raise RuntimeError(
                                     "cannot reconnect without a foreground mask"
                                 )
-                            height, width = first_frame.bgr.shape[:2]
+                            height, width = first_frame.dimensions
                             mask = (
                                 last_mask
                                 if last_mask.shape == (height, width)
@@ -162,7 +170,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             frame = reader.read()
                             result = session.track(frame)
                 return
-            except (RtspDisconnected, LiveResolutionChanged) as error:
+            except (RtspDisconnected, LiveFrameDeviceChanged, LiveResolutionChanged) as error:
                 if epoch >= arguments.reconnect_attempts:
                     raise
                 epoch += 1
