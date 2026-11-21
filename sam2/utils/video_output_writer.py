@@ -37,6 +37,35 @@ class VideoOutputWriterStats:
     closed: bool
 
 
+class _MaskOverlay:
+    def __init__(
+        self,
+        frame_size: tuple[int, int],
+        alpha: float,
+        color_rgb: tuple[int, int, int],
+    ) -> None:
+        width, height = frame_size
+        levels = np.arange(256, dtype=np.float32).reshape(256, 1, 1)
+        color_bgr = np.asarray(color_rgb[::-1], dtype=np.float32)
+        # Match the float32 blend and uint8 truncation for every input level.
+        self._color_lut = (levels * (1.0 - alpha) + color_bgr * alpha).astype(np.uint8)
+        self._frame_bgr = np.empty((height, width, 3), dtype=np.uint8)
+        self._mask = np.empty((height, width), dtype=np.bool_)
+
+    def compose(
+        self, frame_bgr: NDArray[np.uint8], masks: NDArray[np.bool_]
+    ) -> NDArray[np.uint8]:
+        """Return the source for an empty mask, or a BGR overlay in a reusable buffer."""
+        np.any(masks, axis=0, out=self._mask)
+        mask_bytes = self._mask.view(np.uint8)
+        if not cv2.countNonZero(mask_bytes):
+            return frame_bgr
+        np.logical_not(self._mask, out=self._mask)
+        cv2.LUT(frame_bgr, self._color_lut, dst=self._frame_bgr)
+        cv2.copyTo(frame_bgr, mask_bytes, self._frame_bgr)
+        return self._frame_bgr
+
+
 class BoundedVideoMaskWriter:
     """Overlay ordered masks and encode video on a bounded worker queue.
 
@@ -76,7 +105,7 @@ class BoundedVideoMaskWriter:
         self._expected_frame_count = expected_frame_count
         self._expected_object_ids = expected_object_ids
         self._alpha = alpha
-        self._color_bgr = np.asarray(color_rgb[::-1], dtype=np.float32)
+        self._color_rgb = color_rgb
         self._capacity = capacity
         self._queue: queue.Queue[VideoMaskFrame | None] = queue.Queue(capacity)
         self._lock = threading.Lock()
@@ -254,6 +283,7 @@ class BoundedVideoMaskWriter:
             if not writer.isOpened():
                 raise RuntimeError(f"could not open output video: {self._output_path}")
 
+            overlay = _MaskOverlay(self._frame_size, self._alpha, self._color_rgb)
             next_frame_idx = 0
             while True:
                 item = self._queue.get()
@@ -284,13 +314,7 @@ class BoundedVideoMaskWriter:
                         f"mask frame {item.frame_idx} has shape "
                         f"{item.masks.shape[1:]}; expected {(height, width)}"
                     )
-                foreground = np.any(item.masks, axis=0)
-                frame_float = frame_bgr.astype(np.float32)
-                frame_float[foreground] = (
-                    frame_float[foreground] * (1.0 - self._alpha)
-                    + self._color_bgr * self._alpha
-                )
-                writer.write(frame_float.astype(np.uint8))
+                writer.write(overlay.compose(frame_bgr, item.masks))
                 next_frame_idx += 1
                 with self._lock:
                     self._written_frames = next_frame_idx
