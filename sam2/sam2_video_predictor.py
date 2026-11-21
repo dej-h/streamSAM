@@ -28,6 +28,7 @@ from sam2.utils.video_stream import (
     FrameLoadingMode,
     FrameSource,
     LiveVideoFrameSource,
+    SequentialMp4FrameSource,
     create_video_frame_source,
 )
 
@@ -119,8 +120,17 @@ class SAM2VideoPredictor(SAM2Base):
         gpu_frame_staging_slots: int = DEFAULT_GPU_STAGING_SLOT_COUNT,
         enable_concurrent_image_encoder: bool = False,
         gpu_stage_profiler: GpuStageProfiler | None = None,
+        retain_original_frames: bool = False,
     ):
-        """Initialize an inference state."""
+        """Initialize an inference state.
+
+        Set ``retain_original_frames`` for an ordered annotation pass on a lazy
+        video source. The caller must consume one original for each prediction.
+        """
+        if retain_original_frames and enable_concurrent_image_encoder:
+            raise ValueError(
+                "retaining original frames requires sequential image encoding"
+            )
         compute_device = self.device  # device of the model
         if frame_loading == "lazy":
             offload_video_to_cpu = True
@@ -132,6 +142,7 @@ class SAM2VideoPredictor(SAM2Base):
             buffer_capacity=frame_buffer_size,
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
+            retain_original_frames=retain_original_frames,
         )
         return self._init_state_from_source(
             frame_source,
@@ -279,6 +290,19 @@ class SAM2VideoPredictor(SAM2Base):
             self.close_video_source(inference_state)
             raise
         return inference_state
+
+    def start_sequential_annotation(
+        self, inference_state: dict[str, object]
+    ) -> SequentialMp4FrameSource:
+        """Prepare the shared decoder for an annotation pass starting at frame zero."""
+        frame_source = inference_state.get("frame_source")
+        if not isinstance(frame_source, SequentialMp4FrameSource):
+            raise ValueError("sequential annotation requires a lazy video source")
+        frame_stager = inference_state.get("frame_stager")
+        if isinstance(frame_stager, GpuFrameStager):
+            frame_stager.restart_forward_prefetch()
+        frame_source.rewind_original_frames()
+        return frame_source
 
     def close_video_source(self, inference_state) -> None:
         feature_pipeline = inference_state.get("feature_pipeline")

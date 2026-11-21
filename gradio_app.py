@@ -163,20 +163,6 @@ def preprocess_video_in(video_path, session_state):
             session_state,
         )
 
-    capture = cv2.VideoCapture(video_path)
-    if not capture.isOpened():
-        raise gr.Error("Could not open the input video.")
-    try:
-        fps = float(capture.get(cv2.CAP_PROP_FPS))
-        if fps <= 0:
-            fps = 30.0
-        reported_frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        ok, first_frame_bgr = capture.read()
-    finally:
-        capture.release()
-    if not ok:
-        raise gr.Error("The input video contains no decodable frames.")
-
     previous_state = session_state.get("inference_state")
     if previous_state is not None:
         predictor.close_video_source(previous_state)
@@ -191,20 +177,20 @@ def preprocess_video_in(video_path, session_state):
         frame_buffer_size=FRAME_BUFFER_SIZE,
         enable_gpu_frame_staging=DEVICE == "cuda",
         gpu_frame_staging_slots=GPU_STAGING_SLOTS,
+        retain_original_frames=True,
     )
-    metadata = inference_state["frame_source"].metadata
-    if reported_frame_count > 0 and reported_frame_count != metadata.frame_count:
-        predictor.close_video_source(inference_state)
-        raise gr.Error(
-            "Video frame-count metadata changed while initializing the stream: "
-            f"OpenCV reported {reported_frame_count}, streamSAM reported "
-            f"{metadata.frame_count}."
+    try:
+        frame_source = predictor.start_sequential_annotation(inference_state)
+        metadata = frame_source.metadata
+        first_frame = cv2.cvtColor(
+            frame_source.original_frame(0, consume=False), cv2.COLOR_BGR2RGB
         )
-
-    first_frame = cv2.cvtColor(first_frame_bgr, cv2.COLOR_BGR2RGB)
+    except BaseException:
+        predictor.close_video_source(inference_state)
+        raise
     session_state["first_frame"] = copy.deepcopy(first_frame)
     session_state["video_path"] = video_path
-    session_state["video_fps"] = fps
+    session_state["video_fps"] = metadata.fps
     session_state["video_frame_count"] = metadata.frame_count
     session_state["video_frame_size"] = (
         metadata.video_width,
@@ -320,12 +306,13 @@ def propagate_to_all(video_in, session_state):
     if fps is None or fps <= 0:
         fps = 30.0
 
-    unique_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    unique_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
     output_path = os.path.join(
         tempfile.gettempdir(), f"output_video_{unique_id}.mp4"
     )
+    frame_source = predictor.start_sequential_annotation(inference_state)
     writer = BoundedVideoMaskWriter(
-        input_path=video_path,
+        input_path=None,
         output_path=output_path,
         fps=fps,
         frame_size=frame_size,
@@ -334,18 +321,24 @@ def propagate_to_all(video_in, session_state):
         capacity=OUTPUT_QUEUE_SIZE,
     )
 
+    predictions = predictor.propagate_in_video(inference_state)
     try:
-        for frame_idx, object_ids, mask_logits in predictor.propagate_in_video(
-            inference_state
-        ):
+        for frame_idx, object_ids, mask_logits in predictions:
             masks = (mask_logits > 0.0).detach().cpu().numpy()
             if masks.ndim == 4 and masks.shape[1] == 1:
                 masks = masks[:, 0]
-            writer.submit(frame_idx, tuple(object_ids), masks)
+            writer.submit(
+                frame_idx,
+                tuple(object_ids),
+                masks,
+                frame_bgr=frame_source.original_frame(frame_idx),
+            )
         writer_stats = writer.close()
     except BaseException:
         writer.abort()
         raise
+    finally:
+        predictions.close()
 
     session_state["last_output_writer_stats"] = writer_stats
     print(

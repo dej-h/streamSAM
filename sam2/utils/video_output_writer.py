@@ -21,6 +21,7 @@ class VideoMaskFrame:
     frame_idx: int
     object_ids: tuple[int, ...]
     masks: NDArray[np.bool_]
+    frame_bgr: NDArray[np.uint8] | None = None
 
 
 @dataclass(frozen=True)
@@ -37,12 +38,16 @@ class VideoOutputWriterStats:
 
 
 class BoundedVideoMaskWriter:
-    """Overlay ordered masks while decoding and encoding on a bounded worker queue."""
+    """Overlay ordered masks and encode video on a bounded worker queue.
+
+    Supply an input path to decode frames in the worker, or submit each original
+    frame with its mask when the inference decoder already provides the frames.
+    """
 
     def __init__(
         self,
         *,
-        input_path: str | Path,
+        input_path: str | Path | None,
         output_path: str | Path,
         fps: float,
         frame_size: tuple[int, int],
@@ -64,7 +69,7 @@ class BoundedVideoMaskWriter:
         if not 0.0 <= alpha <= 1.0:
             raise ValueError("mask alpha must be between zero and one")
 
-        self._input_path = str(input_path)
+        self._input_path = str(input_path) if input_path is not None else None
         self._output_path = str(output_path)
         self._fps = fps
         self._frame_size = frame_size
@@ -99,7 +104,24 @@ class BoundedVideoMaskWriter:
         frame_idx: int,
         object_ids: tuple[int, ...],
         masks: NDArray[np.bool_],
+        *,
+        frame_bgr: NDArray[np.uint8] | None = None,
     ) -> None:
+        """Queue masks and, when no input path was given, take the original frame.
+
+        The caller must leave the submitted frame unchanged while the worker owns
+        it. The worker retains the array without copying it.
+        """
+        if self._input_path is None:
+            if frame_bgr is None:
+                raise ValueError("submit a BGR frame when no input path is configured")
+            width, height = self._frame_size
+            if frame_bgr.dtype != np.uint8 or frame_bgr.shape != (height, width, 3):
+                raise ValueError(
+                    "submitted frame must be a uint8 BGR image at output size"
+                )
+        elif frame_bgr is not None:
+            raise ValueError("cannot submit a BGR frame when an input path is configured")
         with self._lock:
             self._raise_worker_error_locked()
             if self._closed:
@@ -119,7 +141,7 @@ class BoundedVideoMaskWriter:
         if owned_masks.shape[0] != len(object_ids):
             raise ValueError("mask count does not match object id count")
 
-        item = VideoMaskFrame(frame_idx, object_ids, owned_masks)
+        item = VideoMaskFrame(frame_idx, object_ids, owned_masks, frame_bgr)
         wait_started_at = time.perf_counter()
         waited = False
         while True:
@@ -214,12 +236,14 @@ class BoundedVideoMaskWriter:
         self._worker.join()
 
     def _run(self) -> None:
-        capture = cv2.VideoCapture(self._input_path)
+        capture: cv2.VideoCapture | None = None
         writer: cv2.VideoWriter | None = None
         started_at = time.perf_counter()
         try:
-            if not capture.isOpened():
-                raise RuntimeError(f"could not open input video: {self._input_path}")
+            if self._input_path is not None:
+                capture = cv2.VideoCapture(self._input_path)
+                if not capture.isOpened():
+                    raise RuntimeError(f"could not open input video: {self._input_path}")
             width, height = self._frame_size
             writer = cv2.VideoWriter(
                 self._output_path,
@@ -240,11 +264,15 @@ class BoundedVideoMaskWriter:
                         f"writer received frame {item.frame_idx}; expected "
                         f"{next_frame_idx}"
                     )
-                ok, frame_bgr = capture.read()
-                if not ok:
-                    raise RuntimeError(
-                        f"input video ended before frame {item.frame_idx}"
-                    )
+                frame_bgr = item.frame_bgr
+                if capture is not None:
+                    ok, frame_bgr = capture.read()
+                    if not ok:
+                        raise RuntimeError(
+                            f"input video ended before frame {item.frame_idx}"
+                        )
+                if frame_bgr is None:
+                    raise RuntimeError(f"missing original frame {item.frame_idx}")
                 if (frame_bgr.shape[1], frame_bgr.shape[0]) != self._frame_size:
                     raise RuntimeError(
                         f"source frame {item.frame_idx} has dimensions "
@@ -270,7 +298,8 @@ class BoundedVideoMaskWriter:
             with self._lock:
                 self._worker_error = error
         finally:
-            capture.release()
+            if capture is not None:
+                capture.release()
             if writer is not None:
                 writer.release()
             with self._lock:
