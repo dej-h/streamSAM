@@ -124,10 +124,19 @@ conditioning output and the recent outputs that SAM 2 memory attention or
 object pointers can still use. It removes older non-conditioning outputs and
 their per-object views and tracking metadata.
 
-`LiveMaskResult` contains CPU boolean masks, processed index, decoded sequence,
-source presentation time when available, and time from local frame receipt
-to mask delivery. The latency value excludes camera capture, network transport,
-and buffering before the decoder returns a frame.
+`LiveMaskResult` contains boolean masks with shape `(objects, height, width)`,
+processed index, decoded sequence, source presentation time when available,
+and time from local frame receipt to mask delivery. The latency value excludes
+camera capture, network transport, and buffering before the decoder returns a
+frame.
+
+By default, `LiveVideoSession` returns CPU NumPy arrays. Each array keeps its
+own mask buffer alive after the session advances or closes. Use
+`LiveVideoSession(predictor, first, mask_output="tensor")` to return PyTorch
+tensors on the predictor device for consumers such as GPU compositors. In
+tensor mode, latency measures time to enqueue the result. Consume CUDA masks
+on the stream that ran inference or establish a dependency before using them
+on another stream.
 
 ## Current scope and checks
 

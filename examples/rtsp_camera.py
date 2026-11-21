@@ -67,7 +67,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def report_frame(
-    result: LiveMaskResult,
+    result: LiveMaskResult[NDArray[np.bool_]],
     *,
     epoch: int,
     reader_stats: RtspReaderStats,

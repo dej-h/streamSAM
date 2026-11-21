@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TypedDict, cast
+from typing import Generic, Literal, TypedDict, TypeVar, cast, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -29,17 +29,20 @@ class _LiveInferenceState(TypedDict):
     constants: dict[str, object]
 
 
+_MaskArray = TypeVar("_MaskArray", NDArray[np.bool_], torch.Tensor)
+
+
 @dataclass(frozen=True)
-class LiveMaskResult:
+class LiveMaskResult(Generic[_MaskArray]):
     processed_index: int
     decoded_sequence: int
     presentation_time_seconds: float | None
     receive_to_mask_seconds: float
     object_ids: tuple[int, ...]
-    masks: NDArray[np.bool_]
+    masks: _MaskArray
 
 
-class LiveVideoSession:
+class LiveVideoSession(Generic[_MaskArray]):
     """Feed arriving frames through the existing SAM 2 predict/commit core.
 
     A session tracks one prompted object forward. The caller selects which decoded
@@ -48,15 +51,41 @@ class LiveVideoSession:
     Start a new session after a source discontinuity or resolution change.
     """
 
+    @overload
+    def __init__(
+        self: LiveVideoSession[NDArray[np.bool_]],
+        predictor: SAM2VideoPredictor,
+        first_frame: LiveFrame,
+        *,
+        mask_output: Literal["numpy"] = "numpy",
+        offload_state_to_cpu: bool = True,
+        enable_gpu_frame_staging: bool = True,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: LiveVideoSession[torch.Tensor],
+        predictor: SAM2VideoPredictor,
+        first_frame: LiveFrame,
+        *,
+        mask_output: Literal["tensor"],
+        offload_state_to_cpu: bool = True,
+        enable_gpu_frame_staging: bool = True,
+    ) -> None: ...
+
     def __init__(
         self,
         predictor: SAM2VideoPredictor,
         first_frame: LiveFrame,
         *,
+        mask_output: Literal["numpy", "tensor"] = "numpy",
         offload_state_to_cpu: bool = True,
         enable_gpu_frame_staging: bool = True,
     ) -> None:
+        if mask_output not in ("numpy", "tensor"):
+            raise ValueError("mask_output must be 'numpy' or 'tensor'")
         self._predictor = predictor
+        self._mask_output = mask_output
         self._frame_source = LiveVideoFrameSource(
             first_frame.pixels, image_size=predictor.image_size
         )
@@ -77,7 +106,9 @@ class LiveVideoSession:
         self._prompted = False
         self._failed = False
 
-    def prompt_point(self, x: float, y: float, *, obj_id: int = 1) -> LiveMaskResult:
+    def prompt_point(
+        self, x: float, y: float, *, obj_id: int = 1
+    ) -> LiveMaskResult[_MaskArray]:
         """Prompt the first frame in its original pixel coordinates."""
         return self.prompt_points(np.array([[x, y]], dtype=np.float32), obj_id=obj_id)
 
@@ -87,7 +118,7 @@ class LiveVideoSession:
         *,
         obj_id: int = 1,
         mask: NDArray[np.bool_] | None = None,
-    ) -> LiveMaskResult:
+    ) -> LiveMaskResult[_MaskArray]:
         """Prompt one object with positive (x, y) points on the first frame.
 
         An optional full-resolution boolean mask provides a spatial estimate
@@ -129,7 +160,7 @@ class LiveVideoSession:
 
     def prompt_box(
         self, box: tuple[float, float, float, float], *, obj_id: int = 1
-    ) -> LiveMaskResult:
+    ) -> LiveMaskResult[_MaskArray]:
         """Prompt the first frame with an (x0, y0, x1, y1) box."""
         frame = self._require_unprompted()
         try:
@@ -144,7 +175,7 @@ class LiveVideoSession:
             raise
         return self._commit_current(frame)
 
-    def track(self, frame: LiveFrame) -> LiveMaskResult:
+    def track(self, frame: LiveFrame) -> LiveMaskResult[_MaskArray]:
         """Track the next received frame, preserving the previous SAM 2 memory."""
         previous = self._require_open()
         if not self._prompted:
@@ -182,7 +213,7 @@ class LiveVideoSession:
                 self._state["cached_features"].clear()
                 self._state["constants"].clear()
 
-    def __enter__(self) -> LiveVideoSession:
+    def __enter__(self) -> LiveVideoSession[_MaskArray]:
         return self
 
     def __exit__(
@@ -193,7 +224,7 @@ class LiveVideoSession:
     ) -> None:
         self.close()
 
-    def _commit_current(self, frame: LiveFrame) -> LiveMaskResult:
+    def _commit_current(self, frame: LiveFrame) -> LiveMaskResult[_MaskArray]:
         frame_idx = self._state["num_frames"] - 1
         predictions = self._predictor.propagate_in_video_predictions(
             self._state,
@@ -211,14 +242,21 @@ class LiveVideoSession:
             predictions.close()
         self._prompted = True
         self._retire_old_outputs(next_frame_idx=frame_idx + 1)
-        masks = (committed.mask_logits > 0).squeeze(1).to(device="cpu").numpy().copy()
+        masks = (committed.mask_logits > 0).squeeze(1)
+        output: torch.Tensor | NDArray[np.bool_] = masks
+        if self._mask_output == "numpy":
+            # The threshold produces private storage. NumPy retains the CPU
+            # tensor that owns that storage, including after the session closes.
+            output = masks.to(
+                device="cpu", memory_format=torch.contiguous_format
+            ).numpy()
         return LiveMaskResult(
             processed_index=frame_idx,
             decoded_sequence=frame.decoded_sequence,
             presentation_time_seconds=frame.presentation_time_seconds,
             receive_to_mask_seconds=time.monotonic() - frame.received_at_monotonic,
             object_ids=committed.object_ids,
-            masks=masks,
+            masks=cast(_MaskArray, output),
         )
 
     def _retire_old_outputs(self, *, next_frame_idx: int) -> None:
