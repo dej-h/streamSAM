@@ -41,7 +41,8 @@ uv run --extra gradio python3 gradio_app.py
 
 Upload a video or choose an example, mark the object with an include point,
 then click **Track**. The EdgeTAM backbone may download pretrained TIMM weights
-on first use.
+on first use. The Gradio demo uses FFmpeg with the `libx264` encoder on `PATH`
+to write browser-playable results.
 
 <details>
 <summary>Install with pip</summary>

@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from sam2.utils.h264_video_encoder import H264VideoEncoder
+
 
 _QUEUE_POLL_SECONDS: Final = 0.1
 
@@ -71,6 +73,7 @@ class BoundedVideoMaskWriter:
 
     Supply an input path to decode frames in the worker, or submit each original
     frame with its mask when the inference decoder already provides the frames.
+    Set ``encode_h264`` for browser playback. This requires FFmpeg with libx264.
     """
 
     def __init__(
@@ -85,6 +88,7 @@ class BoundedVideoMaskWriter:
         capacity: int = 4,
         alpha: float = 0.6,
         color_rgb: tuple[int, int, int] = (31, 119, 180),
+        encode_h264: bool = False,
     ) -> None:
         if capacity <= 0:
             raise ValueError("output queue capacity must be positive")
@@ -100,6 +104,7 @@ class BoundedVideoMaskWriter:
 
         self._input_path = str(input_path) if input_path is not None else None
         self._output_path = str(output_path)
+        self._encode_h264 = encode_h264
         self._fps = fps
         self._frame_size = frame_size
         self._expected_frame_count = expected_frame_count
@@ -266,7 +271,7 @@ class BoundedVideoMaskWriter:
 
     def _run(self) -> None:
         capture: cv2.VideoCapture | None = None
-        writer: cv2.VideoWriter | None = None
+        writer: cv2.VideoWriter | H264VideoEncoder | None = None
         started_at = time.perf_counter()
         try:
             if self._input_path is not None:
@@ -274,14 +279,17 @@ class BoundedVideoMaskWriter:
                 if not capture.isOpened():
                     raise RuntimeError(f"could not open input video: {self._input_path}")
             width, height = self._frame_size
-            writer = cv2.VideoWriter(
-                self._output_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                self._fps,
-                (width, height),
-            )
-            if not writer.isOpened():
-                raise RuntimeError(f"could not open output video: {self._output_path}")
+            if self._encode_h264:
+                writer = H264VideoEncoder(self._output_path, self._fps, self._frame_size)
+            else:
+                writer = cv2.VideoWriter(
+                    self._output_path,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    self._fps,
+                    (width, height),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"could not open output video: {self._output_path}")
 
             overlay = _MaskOverlay(self._frame_size, self._alpha, self._color_rgb)
             next_frame_idx = 0
@@ -325,7 +333,12 @@ class BoundedVideoMaskWriter:
             if capture is not None:
                 capture.release()
             if writer is not None:
-                writer.release()
+                try:
+                    writer.release()
+                except BaseException as error:
+                    with self._lock:
+                        if self._worker_error is None:
+                            self._worker_error = error
             with self._lock:
                 self._worker_seconds = time.perf_counter() - started_at
 

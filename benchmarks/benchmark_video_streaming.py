@@ -853,6 +853,7 @@ def run_demo_streaming(
         expected_frame_count=expected_frame_count,
         expected_object_ids=(prompt.obj_id,),
         capacity=4,
+        encode_h264=True,
     )
 
     traces: list[FrameTrace] = []

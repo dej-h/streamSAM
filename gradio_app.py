@@ -319,6 +319,7 @@ def propagate_to_all(video_in, session_state):
         expected_frame_count=frame_count,
         expected_object_ids=(OBJ_ID,),
         capacity=OUTPUT_QUEUE_SIZE,
+        encode_h264=True,
     )
 
     predictions = predictor.propagate_in_video(inference_state)
