@@ -95,7 +95,8 @@ def main() -> None:
             source[2]  # The stager can advance before the writer aborts.
 
             for output_path, input_path in (("shared", None), ("standalone", "input.mp4")):
-                source.rewind_original_frames()
+                if input_path is None:
+                    source.rewind_original_frames()
                 with BoundedVideoMaskWriter(
                     input_path=input_path,
                     output_path=output_path,
