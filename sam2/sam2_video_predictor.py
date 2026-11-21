@@ -1095,6 +1095,12 @@ class SAM2VideoPredictor(SAM2Base):
                 )
             current_out["maskmem_features"] = maskmem_features
             current_out["maskmem_pos_enc"] = maskmem_pos_enc
+            if not pending.memory_already_encoded:
+                # The prediction keeps its score on the compute device until
+                # memory encoding consumes it. Apply the storage policy on commit.
+                current_out["object_score_logits"] = object_score_logits.to(
+                    inference_state["storage_device"], non_blocking=True
+                )
 
         output_dict = inference_state["output_dict"]
         output_dict[pending.storage_key][pending.frame_idx] = current_out
@@ -1425,9 +1431,11 @@ class SAM2VideoPredictor(SAM2Base):
         # them with the rest of the inference state so long videos do not grow VRAM;
         # memory attention moves only its bounded selected pointer window to CUDA.
         obj_ptr = current_out["obj_ptr"].to(storage_device, non_blocking=True)
-        object_score_logits = current_out["object_score_logits"].to(
-            storage_device, non_blocking=True
-        )
+        object_score_logits = current_out["object_score_logits"]
+        if not retain_high_res_masks:
+            object_score_logits = object_score_logits.to(
+                storage_device, non_blocking=True
+            )
         # make a compact version of this frame's output to reduce the state size
         compact_current_out = {
             "maskmem_features": maskmem_features,
