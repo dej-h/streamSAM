@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from sam2.utils.h264_video_encoder import H264VideoEncoder
+
 
 _QUEUE_POLL_SECONDS: Final = 0.1
 
@@ -21,6 +23,7 @@ class VideoMaskFrame:
     frame_idx: int
     object_ids: tuple[int, ...]
     masks: NDArray[np.bool_]
+    frame_bgr: NDArray[np.uint8] | None = None
 
 
 @dataclass(frozen=True)
@@ -36,13 +39,47 @@ class VideoOutputWriterStats:
     closed: bool
 
 
+class _MaskOverlay:
+    def __init__(
+        self,
+        frame_size: tuple[int, int],
+        alpha: float,
+        color_rgb: tuple[int, int, int],
+    ) -> None:
+        width, height = frame_size
+        levels = np.arange(256, dtype=np.float32).reshape(256, 1, 1)
+        color_bgr = np.asarray(color_rgb[::-1], dtype=np.float32)
+        # Match the float32 blend and uint8 truncation for every input level.
+        self._color_lut = (levels * (1.0 - alpha) + color_bgr * alpha).astype(np.uint8)
+        self._frame_bgr = np.empty((height, width, 3), dtype=np.uint8)
+        self._mask = np.empty((height, width), dtype=np.bool_)
+
+    def compose(
+        self, frame_bgr: NDArray[np.uint8], masks: NDArray[np.bool_]
+    ) -> NDArray[np.uint8]:
+        """Return the source for an empty mask, or a BGR overlay in a reusable buffer."""
+        np.any(masks, axis=0, out=self._mask)
+        mask_bytes = self._mask.view(np.uint8)
+        if not cv2.countNonZero(mask_bytes):
+            return frame_bgr
+        np.logical_not(self._mask, out=self._mask)
+        cv2.LUT(frame_bgr, self._color_lut, dst=self._frame_bgr)
+        cv2.copyTo(frame_bgr, mask_bytes, self._frame_bgr)
+        return self._frame_bgr
+
+
 class BoundedVideoMaskWriter:
-    """Overlay ordered masks while decoding and encoding on a bounded worker queue."""
+    """Overlay ordered masks and encode video on a bounded worker queue.
+
+    Supply an input path to decode frames in the worker, or submit each original
+    frame with its mask when the inference decoder already provides the frames.
+    Set ``encode_h264`` for browser playback. This requires FFmpeg with libx264.
+    """
 
     def __init__(
         self,
         *,
-        input_path: str | Path,
+        input_path: str | Path | None,
         output_path: str | Path,
         fps: float,
         frame_size: tuple[int, int],
@@ -51,6 +88,7 @@ class BoundedVideoMaskWriter:
         capacity: int = 4,
         alpha: float = 0.6,
         color_rgb: tuple[int, int, int] = (31, 119, 180),
+        encode_h264: bool = False,
     ) -> None:
         if capacity <= 0:
             raise ValueError("output queue capacity must be positive")
@@ -64,14 +102,15 @@ class BoundedVideoMaskWriter:
         if not 0.0 <= alpha <= 1.0:
             raise ValueError("mask alpha must be between zero and one")
 
-        self._input_path = str(input_path)
+        self._input_path = str(input_path) if input_path is not None else None
         self._output_path = str(output_path)
+        self._encode_h264 = encode_h264
         self._fps = fps
         self._frame_size = frame_size
         self._expected_frame_count = expected_frame_count
         self._expected_object_ids = expected_object_ids
         self._alpha = alpha
-        self._color_bgr = np.asarray(color_rgb[::-1], dtype=np.float32)
+        self._color_rgb = color_rgb
         self._capacity = capacity
         self._queue: queue.Queue[VideoMaskFrame | None] = queue.Queue(capacity)
         self._lock = threading.Lock()
@@ -99,7 +138,24 @@ class BoundedVideoMaskWriter:
         frame_idx: int,
         object_ids: tuple[int, ...],
         masks: NDArray[np.bool_],
+        *,
+        frame_bgr: NDArray[np.uint8] | None = None,
     ) -> None:
+        """Queue masks and, when no input path was given, take the original frame.
+
+        The caller must leave the submitted frame unchanged while the worker owns
+        it. The worker retains the array without copying it.
+        """
+        if self._input_path is None:
+            if frame_bgr is None:
+                raise ValueError("submit a BGR frame when no input path is configured")
+            width, height = self._frame_size
+            if frame_bgr.dtype != np.uint8 or frame_bgr.shape != (height, width, 3):
+                raise ValueError(
+                    "submitted frame must be a uint8 BGR image at output size"
+                )
+        elif frame_bgr is not None:
+            raise ValueError("cannot submit a BGR frame when an input path is configured")
         with self._lock:
             self._raise_worker_error_locked()
             if self._closed:
@@ -119,7 +175,7 @@ class BoundedVideoMaskWriter:
         if owned_masks.shape[0] != len(object_ids):
             raise ValueError("mask count does not match object id count")
 
-        item = VideoMaskFrame(frame_idx, object_ids, owned_masks)
+        item = VideoMaskFrame(frame_idx, object_ids, owned_masks, frame_bgr)
         wait_started_at = time.perf_counter()
         waited = False
         while True:
@@ -214,22 +270,28 @@ class BoundedVideoMaskWriter:
         self._worker.join()
 
     def _run(self) -> None:
-        capture = cv2.VideoCapture(self._input_path)
-        writer: cv2.VideoWriter | None = None
+        capture: cv2.VideoCapture | None = None
+        writer: cv2.VideoWriter | H264VideoEncoder | None = None
         started_at = time.perf_counter()
         try:
-            if not capture.isOpened():
-                raise RuntimeError(f"could not open input video: {self._input_path}")
+            if self._input_path is not None:
+                capture = cv2.VideoCapture(self._input_path)
+                if not capture.isOpened():
+                    raise RuntimeError(f"could not open input video: {self._input_path}")
             width, height = self._frame_size
-            writer = cv2.VideoWriter(
-                self._output_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                self._fps,
-                (width, height),
-            )
-            if not writer.isOpened():
-                raise RuntimeError(f"could not open output video: {self._output_path}")
+            if self._encode_h264:
+                writer = H264VideoEncoder(self._output_path, self._fps, self._frame_size)
+            else:
+                writer = cv2.VideoWriter(
+                    self._output_path,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    self._fps,
+                    (width, height),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"could not open output video: {self._output_path}")
 
+            overlay = _MaskOverlay(self._frame_size, self._alpha, self._color_rgb)
             next_frame_idx = 0
             while True:
                 item = self._queue.get()
@@ -240,11 +302,15 @@ class BoundedVideoMaskWriter:
                         f"writer received frame {item.frame_idx}; expected "
                         f"{next_frame_idx}"
                     )
-                ok, frame_bgr = capture.read()
-                if not ok:
-                    raise RuntimeError(
-                        f"input video ended before frame {item.frame_idx}"
-                    )
+                frame_bgr = item.frame_bgr
+                if capture is not None:
+                    ok, frame_bgr = capture.read()
+                    if not ok:
+                        raise RuntimeError(
+                            f"input video ended before frame {item.frame_idx}"
+                        )
+                if frame_bgr is None:
+                    raise RuntimeError(f"missing original frame {item.frame_idx}")
                 if (frame_bgr.shape[1], frame_bgr.shape[0]) != self._frame_size:
                     raise RuntimeError(
                         f"source frame {item.frame_idx} has dimensions "
@@ -256,13 +322,7 @@ class BoundedVideoMaskWriter:
                         f"mask frame {item.frame_idx} has shape "
                         f"{item.masks.shape[1:]}; expected {(height, width)}"
                     )
-                foreground = np.any(item.masks, axis=0)
-                frame_float = frame_bgr.astype(np.float32)
-                frame_float[foreground] = (
-                    frame_float[foreground] * (1.0 - self._alpha)
-                    + self._color_bgr * self._alpha
-                )
-                writer.write(frame_float.astype(np.uint8))
+                writer.write(overlay.compose(frame_bgr, item.masks))
                 next_frame_idx += 1
                 with self._lock:
                     self._written_frames = next_frame_idx
@@ -270,9 +330,15 @@ class BoundedVideoMaskWriter:
             with self._lock:
                 self._worker_error = error
         finally:
-            capture.release()
+            if capture is not None:
+                capture.release()
             if writer is not None:
-                writer.release()
+                try:
+                    writer.release()
+                except BaseException as error:
+                    with self._lock:
+                        if self._worker_error is None:
+                            self._worker_error = error
             with self._lock:
                 self._worker_seconds = time.perf_counter() - started_at
 

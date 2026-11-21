@@ -226,6 +226,21 @@ class GpuFrameStager:
         torch.cuda.current_stream(self._device).wait_event(slot.copy_finished_event)
         return GpuFrameLease(self, slot)
 
+    def restart_forward_prefetch(self) -> None:
+        """Finish outstanding reads before the source restarts at frame zero."""
+        with self._condition:
+            while True:
+                self._raise_worker_error_locked()
+                if self._closed:
+                    raise RuntimeError("GPU frame stager is closed")
+                if not self._pending_indices and all(
+                    slot.state != "staging" for slot in self._slots
+                ):
+                    break
+                self._condition.wait()
+            self._last_acquired_index = None
+            self._prefetch_direction = 1
+
     def close(self) -> None:
         with self._condition:
             if self._closed:

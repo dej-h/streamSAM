@@ -9,12 +9,14 @@ from pathlib import Path
 from threading import Condition, Lock, Thread
 from typing import Literal, Protocol, Sequence, runtime_checkable
 
+from av import VideoFrame
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 import torch
 
 from sam2.utils.misc import _load_img_as_tensor, load_video_frames
+from sam2.utils.video_preprocessing import normalize_video_frame, video_frame_device
 
 
 VideoInput = str | bytes
@@ -43,6 +45,10 @@ class FrameSourceStats:
     wait_count: int
     wait_seconds: float
     closed: bool
+
+
+class LiveFrameDeviceChanged(ValueError):
+    """A frame changed from host to device memory, or the reverse."""
 
 
 class LiveResolutionChanged(ValueError):
@@ -114,23 +120,30 @@ class LiveVideoFrameSource:
 
     def __init__(
         self,
-        first_bgr_frame: NDArray[np.uint8],
+        first_bgr_frame: NDArray[np.uint8] | VideoFrame,
         image_size: int,
         img_mean: RgbMean = (0.485, 0.456, 0.406),
         img_std: RgbStd = (0.229, 0.224, 0.225),
     ) -> None:
         if image_size <= 0:
             raise ValueError("image size must be positive")
-        height, width = _bgr_dimensions(first_bgr_frame)
+        height, width = self._dimensions(first_bgr_frame)
         self._image_size = image_size
         self._video_height = height
         self._video_width = width
-        self._img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
-        self._img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        self.device = self._device(first_bgr_frame)
+        self._img_mean = torch.tensor(img_mean, device=self.device, dtype=torch.float32)[:, None, None]
+        self._img_std = torch.tensor(img_std, device=self.device, dtype=torch.float32)[:, None, None]
         self._preprocessing_identity = _preprocessing_identity(
             image_size, img_mean, img_std
         )
+        if isinstance(first_bgr_frame, VideoFrame):
+            self._preprocessing_identity = (
+                f"native-yuv-rgb-square-{image_size}:mean={img_mean}:std={img_std}"
+            )
         self._lock = Lock()
+        self._native_cuda_frame: VideoFrame | None = None
+        self._input_reads_complete = torch.cuda.Event() if self.device.type == "cuda" else None
         self._current_frame = self._normalize_frame(first_bgr_frame)
         self._current_index = 0
         self._closed = False
@@ -160,17 +173,23 @@ class LiveVideoFrameSource:
             return self._current_frame
 
     def append_bgr_frame(self, bgr_frame: NDArray[np.uint8]) -> int:
-        height, width = _bgr_dimensions(bgr_frame)
+        return self.append_frame(bgr_frame)
+
+    def append_frame(self, pixels: NDArray[np.uint8] | VideoFrame) -> int:
+        height, width = self._dimensions(pixels)
         if (height, width) != (self._video_height, self._video_width):
             raise LiveResolutionChanged(
                 "live video dimensions changed; start a new tracking session"
             )
-        normalized = self._normalize_frame(bgr_frame)
+        if self._device(pixels) != self.device:
+            raise LiveFrameDeviceChanged(
+                "live video frame device changed; start a new tracking session"
+            )
         with self._lock:
             if self._closed:
                 raise RuntimeError("live frame source is closed")
+            self._current_frame = self._normalize_frame(pixels)
             self._current_index += 1
-            self._current_frame = normalized
             return self._current_index
 
     def stats(self) -> FrameSourceStats:
@@ -188,17 +207,47 @@ class LiveVideoFrameSource:
 
     def close(self) -> None:
         with self._lock:
+            if self._native_cuda_frame is not None and self._input_reads_complete is not None:
+                self._input_reads_complete.synchronize()
+                self._native_cuda_frame = None
             self._closed = True
             self._current_frame = torch.empty(0)
 
-    def _normalize_frame(self, bgr_frame: np.ndarray) -> torch.Tensor:
+    @staticmethod
+    def _dimensions(pixels: NDArray[np.uint8] | VideoFrame) -> tuple[int, int]:
+        if isinstance(pixels, VideoFrame):
+            return pixels.height, pixels.width
+        return _bgr_dimensions(pixels)
+
+    @staticmethod
+    def _device(pixels: NDArray[np.uint8] | VideoFrame) -> torch.device:
+        if isinstance(pixels, VideoFrame):
+            return video_frame_device(pixels)
+        return torch.device("cpu")
+
+    def _normalize_frame(self, pixels: NDArray[np.uint8] | VideoFrame) -> torch.Tensor:
+        if isinstance(pixels, VideoFrame):
+            normalized = normalize_video_frame(
+                pixels, self._image_size, self._img_mean, self._img_std,
+                input_reads_complete=self._input_reads_complete,
+            )
+            if self._input_reads_complete is not None:
+                # The producer-readiness barrier in normalize_video_frame also
+                # completes prior surface reads before we replace their owner.
+                self._native_cuda_frame = pixels
+            return normalized
         return _normalize_bgr_frame(
-            bgr_frame, self._image_size, self._img_mean, self._img_std
+            pixels, self._image_size, self._img_mean, self._img_std
         )
 
 
 class SequentialMp4FrameSource:
-    """Pull normalized MP4 frames into a bounded CPU queue."""
+    """Pull normalized MP4 frames into a bounded CPU queue.
+
+    Sequential annotation can retain the BGR frames used for normalization.
+    The original-frame window covers the normalized queue, the current
+    prediction, and one adjacent frame prefetched by the GPU stager.
+    """
 
     def __init__(
         self,
@@ -208,6 +257,7 @@ class SequentialMp4FrameSource:
         img_mean: RgbMean,
         img_std: RgbStd,
         pin_memory: bool = False,
+        retain_original_frames: bool = False,
     ) -> None:
         if image_size <= 0:
             raise ValueError("image size must be positive")
@@ -253,6 +303,9 @@ class SequentialMp4FrameSource:
         self._pin_memory = pin_memory and torch.cuda.is_available()
         self._condition = Condition()
         self._frames: OrderedDict[int, torch.Tensor] = OrderedDict()
+        self._original_frames: OrderedDict[int, NDArray[np.uint8]] | None = (
+            OrderedDict() if retain_original_frames else None
+        )
         self._generation = 0
         self._decode_index = 0
         self._seek_request: tuple[int, int] | None = None
@@ -298,6 +351,41 @@ class SequentialMp4FrameSource:
                 self._condition.wait()
                 self._wait_seconds += time.perf_counter() - wait_started_at
 
+    def rewind_original_frames(self) -> None:
+        """Start an annotation pass after any previous model requests finish."""
+        with self._condition:
+            self._raise_if_unavailable_locked()
+            if self._original_frames is None:
+                raise RuntimeError("this frame source does not retain original frames")
+            if 0 not in self._original_frames and self._decode_index > 0:
+                self._request_seek_locked(0)
+
+    def original_frame(self, index: int, *, consume: bool = True) -> NDArray[np.uint8]:
+        """Read an original frame for an ordered annotation pass.
+
+        A consuming read follows inference at the same index and releases any
+        queued tensor for a cached prediction. The first-frame preview can read
+        without consuming it.
+        """
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        with self._condition:
+            originals = self._original_frames
+            if originals is None:
+                raise RuntimeError("this frame source does not retain original frames")
+            while True:
+                self._raise_if_unavailable_locked()
+                original = originals.get(index)
+                if original is not None:
+                    if consume:
+                        del originals[index]
+                        self._drop_frames_before_locked(index + 1)
+                        self._condition.notify_all()
+                    return original
+                if index < self._decode_index and self._seek_request is None:
+                    raise RuntimeError(f"original frame {index} is no longer available")
+                self._condition.wait()
+
     def stats(self) -> FrameSourceStats:
         with self._condition:
             return FrameSourceStats(
@@ -317,6 +405,8 @@ class SequentialMp4FrameSource:
             if should_join:
                 self._closed = True
                 self._frames.clear()
+                if self._original_frames is not None:
+                    self._original_frames.clear()
                 self._condition.notify_all()
         if should_join:
             self._thread.join()
@@ -360,6 +450,10 @@ class SequentialMp4FrameSource:
                     if generation != self._generation:
                         continue
                     self._frames[decode_index] = frame
+                    if self._original_frames is not None:
+                        self._original_frames[decode_index] = bgr_frame
+                        if len(self._original_frames) > self._capacity + 2:
+                            self._original_frames.popitem(last=False)
                     self._decoded_frames += 1
                     self._maximum_depth = max(
                         self._maximum_depth, len(self._frames)
@@ -416,6 +510,8 @@ class SequentialMp4FrameSource:
     def _request_seek_locked(self, index: int) -> None:
         self._generation += 1
         self._frames.clear()
+        if self._original_frames is not None:
+            self._original_frames.clear()
         self._seek_request = (index, self._generation)
         self._seek_count += 1
         self._condition.notify_all()
@@ -631,10 +727,13 @@ def create_video_frame_source(
     img_std: RgbStd = (0.229, 0.224, 0.225),
     async_loading_frames: bool = False,
     compute_device: torch.device = torch.device("cuda"),
+    retain_original_frames: bool = False,
 ) -> FrameSource:
     is_mp4_input = isinstance(video_path, bytes) or os.path.splitext(video_path)[
         -1
     ] in (".mp4", ".MP4")
+    if retain_original_frames and (loading_mode != "lazy" or not is_mp4_input):
+        raise ValueError("retaining original frames requires lazy MP4 input")
     if loading_mode == "lazy":
         if is_mp4_input:
             return SequentialMp4FrameSource(
@@ -647,6 +746,7 @@ def create_video_frame_source(
                 # host memory over long videos. A bounded GPU stager must own and reuse
                 # pinned buffers instead of making them part of the decoder queue.
                 pin_memory=False,
+                retain_original_frames=retain_original_frames,
             )
         if isinstance(video_path, str) and os.path.isdir(video_path):
             return SequentialImageDirectoryFrameSource(

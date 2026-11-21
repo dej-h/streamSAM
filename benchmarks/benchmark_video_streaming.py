@@ -830,6 +830,7 @@ def run_demo_streaming(
         frame_loading="lazy",
         frame_buffer_size=arguments.frame_buffer_size,
         enable_gpu_frame_staging=arguments.device.type == "cuda",
+        retain_original_frames=True,
     )
     init_seconds = time.perf_counter() - init_started_at
     sampler.capture("stream_initialized")
@@ -839,18 +840,20 @@ def run_demo_streaming(
     prompt_seconds = time.perf_counter() - prompt_started_at
     sampler.capture("post_prompt", prompt.frame_idx)
 
-    metadata = state["frame_source"].metadata
+    frame_source = predictor.start_sequential_annotation(state)
+    metadata = frame_source.metadata
     expected_frame_count = metadata.frame_count
     if arguments.max_frames is not None:
         expected_frame_count = min(expected_frame_count, arguments.max_frames)
     writer = BoundedVideoMaskWriter(
-        input_path=arguments.video_path,
+        input_path=None,
         output_path=run_directory / "output.mp4",
         fps=metadata.fps if metadata.fps is not None else 30.0,
         frame_size=(metadata.video_width, metadata.video_height),
         expected_frame_count=expected_frame_count,
         expected_object_ids=(prompt.obj_id,),
         capacity=4,
+        encode_h264=True,
     )
 
     traces: list[FrameTrace] = []
@@ -869,7 +872,12 @@ def run_demo_streaming(
             masks = prediction.binary_masks.numpy()
             if masks.ndim == 4 and masks.shape[1] == 1:
                 masks = masks[:, 0]
-            writer.submit(prediction.frame_idx, prediction.object_ids, masks)
+            writer.submit(
+                prediction.frame_idx,
+                prediction.object_ids,
+                masks,
+                frame_bgr=frame_source.original_frame(prediction.frame_idx),
+            )
             output_frame_seconds = time.perf_counter() - output_started_at
             trace = FrameTrace(
                 repeat_index=config.repeat_index,

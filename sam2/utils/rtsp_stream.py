@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import closing
+from itertools import count
 import math
 import time
 from collections import deque
@@ -14,8 +17,15 @@ from urllib.parse import urlsplit
 import cv2
 import numpy as np
 from numpy.typing import NDArray
+import torch
 
-from sam2.live_frame import CapturedFrame
+from sam2.live_frame import CapturedFrame, CapturedVideoFrame, LiveFrame
+from sam2.utils.rtsp_decoder import (
+    DecodeMode,
+    DecoderBackend,
+    RtspDecoderUnavailable,
+    decode_rtsp,
+)
 
 
 class RtspDisconnected(ConnectionError):
@@ -31,6 +41,8 @@ class RtspReaderStats:
     dropped_frames: int
     disconnected: bool
     closed: bool
+    decoder_backend: DecoderBackend | None = None
+    fallback_reason: str | None = None
 
 
 class VideoCaptureLike(Protocol):
@@ -54,7 +66,8 @@ class RtspFrameReader:
     reader and predictor session after a disconnect, so temporal state is never
     silently carried across a camera gap.
 
-    Decoder timeouts use OpenCV's defaults unless explicitly overridden.
+    PyAV uses CUDA by default when the inference device and stream support it.
+    Open and read deadlines match OpenCV's FFmpeg defaults unless overridden.
     ``read()`` waits for a frame or decoder termination; an optional caller
     timeout limits only that wait. ``close()`` joins the decoder worker and
     can wait for an in-progress backend operation to finish.
@@ -67,7 +80,9 @@ class RtspFrameReader:
         capacity: int = 4,
         open_timeout_seconds: float | None = None,
         read_timeout_seconds: float | None = None,
-        capture_factory: CaptureFactory = cv2.VideoCapture,
+        decoder: DecodeMode = "auto",
+        inference_device: torch.device | str | None = None,
+        capture_factory: CaptureFactory | None = None,
     ) -> None:
         if urlsplit(url).scheme not in ("rtsp", "rtsps"):
             raise ValueError("RTSP URL must use rtsp:// or rtsps://")
@@ -80,21 +95,31 @@ class RtspFrameReader:
         self._capacity = capacity
         self._open_timeout_seconds = open_timeout_seconds
         self._read_timeout_seconds = read_timeout_seconds
+        if decoder not in ("auto", "cpu", "cuda"):
+            raise ValueError("decoder must be auto, cpu, or cuda")
+        if capture_factory is not None and decoder == "cuda":
+            raise ValueError("an OpenCV capture factory supplies CPU frames")
+        self._decoder = decoder
+        self._inference_device = (
+            torch.device(inference_device) if inference_device is not None else None
+        )
         self._capture_factory = capture_factory
         self._condition = Condition()
-        self._frames: deque[CapturedFrame] = deque()
+        self._frames: deque[LiveFrame] = deque()
         self._decoded_frames = 0
         self._dropped_frames = 0
         self._maximum_depth = 0
         self._disconnected = False
         self._closed = False
-        self._failure: str | None = None
+        self._failure: tuple[type[RtspDisconnected] | type[RtspDecoderUnavailable], str] | None = None
+        self._decoder_backend: DecoderBackend | None = None
+        self._fallback_reason: str | None = None
         self._worker = Thread(
             target=self._decode_loop, name="sam2-rtsp-reader", daemon=True
         )
         self._worker.start()
 
-    def read(self, timeout_seconds: float | None = None) -> CapturedFrame:
+    def read(self, timeout_seconds: float | None = None) -> LiveFrame:
         if timeout_seconds is not None and (
             not math.isfinite(timeout_seconds) or timeout_seconds <= 0
         ):
@@ -107,7 +132,8 @@ class RtspFrameReader:
                 if self._closed:
                     raise RuntimeError("RTSP reader is closed")
                 if self._failure is not None:
-                    raise RtspDisconnected(self._failure) from None
+                    error_type, reason = self._failure
+                    raise error_type(reason) from None
                 if self._disconnected:
                     raise RtspDisconnected("RTSP stream disconnected")
                 remaining = None if deadline is None else deadline - time.monotonic()
@@ -129,6 +155,8 @@ class RtspFrameReader:
                 dropped_frames=self._dropped_frames,
                 disconnected=self._disconnected,
                 closed=self._closed,
+                decoder_backend=self._decoder_backend,
+                fallback_reason=self._fallback_reason,
             )
 
     def close(self) -> None:
@@ -153,70 +181,81 @@ class RtspFrameReader:
         self.close()
 
     def _decode_loop(self) -> None:
-        capture: VideoCaptureLike | None = None
         failure = "RTSP stream could not be opened"
         try:
-            parameters: list[int] = []
-            if self._open_timeout_seconds is not None:
-                parameters.extend(
-                    [
-                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                        int(self._open_timeout_seconds * 1000),
-                    ]
-                )
-            if self._read_timeout_seconds is not None:
-                parameters.extend(
-                    [
-                        cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                        int(self._read_timeout_seconds * 1000),
-                    ]
-                )
-            capture = self._capture_factory(
+            with closing(self._iter_frames()) as frames:
+                while True:
+                    with self._condition:
+                        if self._closed:
+                            return
+                    frame, backend, reason = next(frames)
+                    failure = "RTSP decoder failed"
+                    with self._condition:
+                        if self._closed:
+                            return
+                        self._decoder_backend = backend
+                        self._fallback_reason = reason
+                        self._decoded_frames += 1
+                        if len(self._frames) == self._capacity:
+                            self._frames.popleft()
+                            self._dropped_frames += 1
+                        self._frames.append(frame)
+                        self._maximum_depth = max(self._maximum_depth, len(self._frames))
+                        self._condition.notify_all()
+        except StopIteration:
+            self._finish()
+        except RtspDecoderUnavailable as error:
+            self._finish((RtspDecoderUnavailable, str(error)))
+        except Exception as error:
+            self._finish((RtspDisconnected, f"{failure} ({type(error).__name__})"))
+
+    def _finish(
+        self,
+        failure: tuple[type[RtspDisconnected] | type[RtspDecoderUnavailable], str] | None = None,
+    ) -> None:
+        with self._condition:
+            self._failure = failure
+            self._disconnected = True
+            self._condition.notify_all()
+
+    def _iter_frames(self) -> Generator[tuple[LiveFrame, DecoderBackend, str | None], None, None]:
+        factory = self._capture_factory
+        if factory is None:
+            with closing(decode_rtsp(
                 self._url,
-                cv2.CAP_FFMPEG,
-                parameters,
-            )
+                mode=self._decoder,
+                inference_device=self._inference_device,
+                open_timeout_seconds=self._open_timeout_seconds,
+                read_timeout_seconds=self._read_timeout_seconds,
+            )) as frames:
+                for index, (pixels, backend, reason) in enumerate(frames):
+                    yield CapturedVideoFrame(pixels, index, time.monotonic(), pixels.time), backend, reason
+            return
+
+        parameters: list[int] = []
+        if self._open_timeout_seconds is not None:
+            parameters.extend([
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(self._open_timeout_seconds * 1000)
+            ])
+        if self._read_timeout_seconds is not None:
+            parameters.extend([
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(self._read_timeout_seconds * 1000)
+            ])
+        capture = factory(self._url, cv2.CAP_FFMPEG, parameters)
+        try:
             if not capture.isOpened():
-                raise RtspDisconnected(failure)
-            failure = "RTSP decoder failed"
-            while True:
-                with self._condition:
-                    if self._closed:
-                        return
+                raise RtspDisconnected("RTSP stream could not be opened")
+            for index in count():
                 decoded, bgr = capture.read()
                 received_at = time.monotonic()
                 if not decoded:
-                    with self._condition:
-                        self._disconnected = True
-                        self._condition.notify_all()
                     return
                 if bgr.ndim != 3 or bgr.shape[2] != 3 or bgr.dtype != np.uint8:
                     raise ValueError("RTSP decoder returned a non-BGR frame")
                 pts = self._presentation_time_seconds(capture)
-                with self._condition:
-                    if self._closed:
-                        return
-                    frame = CapturedFrame(
-                        bgr=bgr,
-                        decoded_sequence=self._decoded_frames,
-                        received_at_monotonic=received_at,
-                        presentation_time_seconds=pts,
-                    )
-                    self._decoded_frames += 1
-                    if len(self._frames) == self._capacity:
-                        self._frames.popleft()
-                        self._dropped_frames += 1
-                    self._frames.append(frame)
-                    self._maximum_depth = max(self._maximum_depth, len(self._frames))
-                    self._condition.notify_all()
-        except BaseException:
-            with self._condition:
-                self._failure = failure
-                self._disconnected = True
-                self._condition.notify_all()
+                yield CapturedFrame(bgr, index, received_at, pts), "cpu", None
         finally:
-            if capture is not None:
-                capture.release()
+            capture.release()
 
     @staticmethod
     def _presentation_time_seconds(capture: VideoCaptureLike) -> float | None:
