@@ -130,13 +130,13 @@ and time from local frame receipt to mask delivery. The latency value excludes
 camera capture, network transport, and buffering before the decoder returns a
 frame.
 
-By default, `LiveVideoSession` returns CPU NumPy arrays. Each array keeps its
-own mask buffer alive after the session advances or closes. Use
+By default, `LiveVideoSession` transfers masks directly into NumPy-owned CPU
+arrays that remain valid after the session advances or closes. Use
 `LiveVideoSession(predictor, first, mask_output="tensor")` to return PyTorch
 tensors on the predictor device for consumers such as GPU compositors. In
 tensor mode, latency measures time to enqueue the result. Consume CUDA masks
-on the stream that ran inference or establish a dependency before using them
-on another stream.
+on the stream that ran inference. For a different stream, establish a
+dependency and keep the mask storage alive until that stream finishes reading it.
 
 ## Current scope and checks
 

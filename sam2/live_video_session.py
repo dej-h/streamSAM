@@ -245,11 +245,11 @@ class LiveVideoSession(Generic[_MaskArray]):
         masks = (committed.mask_logits > 0).squeeze(1)
         output: torch.Tensor | NDArray[np.bool_] = masks
         if self._mask_output == "numpy":
-            # The threshold produces private storage. NumPy retains the CPU
-            # tensor that owns that storage, including after the session closes.
-            output = masks.to(
-                device="cpu", memory_format=torch.contiguous_format
-            ).numpy()
+            # Transfer directly into NumPy-owned storage. The blocking copy
+            # makes the array ready for CPU readers when the call returns.
+            cpu_masks = np.empty(masks.shape, dtype=np.bool_)
+            torch.from_numpy(cpu_masks).copy_(masks)
+            output = cpu_masks
         return LiveMaskResult(
             processed_index=frame_idx,
             decoded_sequence=frame.decoded_sequence,
