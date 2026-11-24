@@ -82,9 +82,11 @@ usual. When finished, call `predictor.close_video_source(state)` to release
 the frame source and staging workers. The [Gradio app](gradio_app.py) shows
 prompt handling and bounded video output together.
 
-EdgeTAM is the currently verified model. The adapter boundaries are intended
-to support other SAM 2-family models, but compatibility with those models has
-not been validated yet.
+The bundled demo uses EdgeTAM. The finite-video path has also been tested with
+Meta SAM 2 Tiny and SAM 2.1 Tiny. The
+[model compatibility report](docs/SAM2_MODEL_COMPATIBILITY.md) records the
+tested checkpoints, FP32 mask parity, and BF16 differences. Other SAM 2
+checkpoints have yet to be tested directly.
 
 ## How it works
 

@@ -59,9 +59,10 @@ Benchmark setup: NVIDIA GeForce RTX 5060 Laptop GPU, BF16, no compilation.
 | Independent 96-frame batches | 1,000 / 1,000 frames | 17.46 | 4.40 GiB |
 | streamSAM | 1,000 / 1,000 frames | **24.49** | **2.52 GiB** |
 
-The eager run was stopped at the configured host RSS limit before it could
-materialize the complete input tensor. This was a recorded safety stop, not a
-CUDA out-of-memory result.
+The host RSS safety limit stopped eager loading before it could materialize
+the complete input tensor or reach CUDA inference. The eager run has no
+comparable throughput result. The FPS comparison covers the two methods that
+completed this matched run on the hardware above.
 
 The implementation and lower-level profiling notes are in
 [`SAM2_GPU_STREAMING_PIPELINE.md`](../docs/SAM2_GPU_STREAMING_PIPELINE.md).
